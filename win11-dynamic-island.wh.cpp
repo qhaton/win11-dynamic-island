@@ -4,6 +4,7 @@
 // @description     An interactive Dynamic Island overlay and taskbar companion for Windows 11
 // @version         0.1.4
 // @author          Tederby and Qhaton
+// @github          https://github.com/qhaton
 // @include         explorer.exe
 // @compilerOptions -ld2d1 -ldwrite -lwindowscodecs -luxtheme -lole32 -loleaut32 -lruntimeobject -lwindowsapp -lshcore -lversion -lgdi32 -ldwmapi -luser32 -lshell32 -ladvapi32 -lsetupapi -lwinhttp
 // @license         MIT
