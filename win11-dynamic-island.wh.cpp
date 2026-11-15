@@ -2,7 +2,7 @@
 // @id              win11-dynamic-island
 // @name            Dynamic Island for Windows 11
 // @description     An interactive Dynamic Island overlay and taskbar companion for Windows 11
-// @version         0.1.17
+// @version         0.1.19
 // @author          Tederby and Qhaton
 // @github          https://github.com/qhaton
 // @include         explorer.exe
@@ -126,6 +126,7 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 #include <condition_variable>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <memory>
 #include <utility>
@@ -154,8 +155,9 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 #include <devpkey.h>
 #include <winhttp.h>
 
+// Windows DEVPKEY_Device_BatteryLevel property key.
 DEFINE_DEVPROPKEY(DEVPKEY_Device_BatteryLevel,
-0x104EA319, 0x6EE2, 0x4702, 0xB3, 0xF1, 0xD3, 0x8F, 0xE6, 0xB1, 0x8B, 0xDA, 2);
+    0x104EA319, 0x6EE2, 0x4701, 0xBD, 0x47, 0x8D, 0xDB, 0xF4, 0x25, 0xBB, 0xE5, 2);
 
 // ============================================================================
 // [Module] src\common\defs.h
@@ -1022,6 +1024,7 @@ private:
     BYTE m_batteryPercent = 100;
     bool m_isACConnected = false;
     bool m_wasACConnected = false;
+    bool m_hasKnownACStatus = false;
     bool m_lowBatteryAlerted = false;
     bool m_isRunning = false;
     ULONGLONG m_lastPollTick = 0;
@@ -2696,7 +2699,19 @@ IslandMetrics LayoutEngine::CalculateMetrics(
     int compactH = tbHeight - 6;
     if (compactH < 26) compactH = 26;
     
-    m.isEmbedded = (tbInfo.position == TaskbarPosition::Top);
+    const ModSettings layoutSettings = GetSettingsSnapshot();
+    switch (layoutSettings.placement) {
+        case PlacementMode::TopEmbed:
+            m.isEmbedded = true;
+            break;
+        case PlacementMode::Floating:
+            m.isEmbedded = false;
+            break;
+        case PlacementMode::Auto:
+        default:
+            m.isEmbedded = (tbInfo.position == TaskbarPosition::Top);
+            break;
+    }
     
     if (state == IslandState::Hidden) {
         m.width = 0.0f;
@@ -2772,9 +2787,14 @@ IslandMetrics LayoutEngine::CalculateMetrics(
     m.posX = static_cast<float>(centerX) - (m.width / 2.0f);
     
     if (m.isEmbedded) {
-        int topAnchor = (tbInfo.taskbarRect.top >= tbInfo.monitorRect.top)
-                        ? tbInfo.taskbarRect.top
-                        : tbInfo.monitorRect.top;
+        // Forced Top Embed always anchors to the monitor's top edge. In Auto
+        // mode with a top taskbar, use the taskbar's actual top coordinate.
+        int topAnchor = tbInfo.monitorRect.top;
+        if (layoutSettings.placement == PlacementMode::Auto &&
+            tbInfo.position == TaskbarPosition::Top &&
+            tbInfo.taskbarRect.top >= tbInfo.monitorRect.top) {
+            topAnchor = tbInfo.taskbarRect.top;
+        }
         
         if (state == IslandState::Expanded) {
             m.posY = static_cast<float>(topAnchor + 3);
@@ -3519,15 +3539,20 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::Power: {
-            // iOS-style charging pill: green battery + percentage, no text.
+            const bool charging = trState.title != L"On battery";
             D2D1_RECT_F batRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
-            m_renderer->DrawIconImage(Graphics::IconType::BatteryHorizontal, batRect,
-                                      D2D1::ColorF(0.188f, 0.820f, 0.345f, alpha));
-            
-            int pVal = trState.value > 0 ? trState.value : 62;
+            const D2D1_COLOR_F batteryColor = charging
+                ? D2D1::ColorF(0.188f, 0.820f, 0.345f, alpha)
+                : D2D1::ColorF(0.92f, 0.68f, 0.20f, alpha);
+            m_renderer->DrawIconImage(Graphics::IconType::BatteryHorizontal, batRect, batteryColor);
+
+            std::wstring powerLabel = charging ? L"Charging" : L"On battery";
+            if (trState.value >= 0 && trState.value <= 100) {
+                powerLabel += L"  " + std::to_wstring(trState.value) + L"%";
+            }
             m_renderer->DrawTextString(
-                std::to_wstring(pVal) + L"%",
-                D2D1::RectF(38.0f, (h - 16.0f) / 2.0f, w - 14.0f, (h + 16.0f) / 2.0f),
+                powerLabel,
+                D2D1::RectF(40.0f, (h - 16.0f) / 2.0f, w - 10.0f, (h + 16.0f) / 2.0f),
                 D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
                 12.0f,
                 true
@@ -4685,13 +4710,24 @@ DWORD WINAPI ThumbnailWorkerThreadProc(LPVOID param) {
         return 0;
     }
     
-    const HRESULT comInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(comInitHr)) {
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (const winrt::hresult_error& e) {
         MediaService* self = ctx->self;
+        LogError(L"Thumbnail worker WinRT initialization failed (HRESULT=0x%08X): %s",
+                 static_cast<unsigned>(e.code()), e.message().c_str());
         self->FinishThumbnailFetch();
         self->RequestiTunesArtworkFallback(ctx->trackId);
         delete ctx;
         // Decrement only after the fallback has had a chance to register itself.
+        self->ThumbnailWorkerFinished();
+        return 0;
+    } catch (...) {
+        MediaService* self = ctx->self;
+        LogError(L"Thumbnail worker WinRT initialization failed (unknown error)");
+        self->FinishThumbnailFetch();
+        self->RequestiTunesArtworkFallback(ctx->trackId);
+        delete ctx;
         self->ThumbnailWorkerFinished();
         return 0;
     }
@@ -4745,7 +4781,7 @@ DWORD WINAPI ThumbnailWorkerThreadProc(LPVOID param) {
     
     delete ctx;
 
-    if (SUCCEEDED(comInitHr)) CoUninitialize();
+    winrt::uninit_apartment();
     // Keep this worker counted until any replacement/fallback worker is registered.
     self->ThumbnailWorkerFinished();
     return 0;
@@ -4962,37 +4998,50 @@ DWORD WINAPI MediaService::iTunesArtworkWorkerThreadStatic(LPVOID param) {
     }
     
     const HRESULT comInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    
     MediaService* self = ctx->self;
+    if (FAILED(comInitHr)) {
+        LogError(L"Online artwork worker COM initialization failed (HRESULT=0x%08X)",
+                 static_cast<unsigned>(comInitHr));
+        self->m_isFetchingItunes = false;
+        self->ThumbnailWorkerFinished();
+        delete ctx;
+        return 0;
+    }
     
     // Look the track up on the iTunes Search API and download its artwork.
-    // On any failure the bitmap simply stays cleared and the island shows the
-    // placeholder gradient.
-    std::wstring term = ctx->artist.empty() ? ctx->title : (ctx->artist + L" " + ctx->title);
-    if (!term.empty()) {
-        const std::wstring searchUrl =
-            L"https://itunes.apple.com/search?term=" + PercentEncodeUtf8(term) +
-            L"&entity=song&limit=1&media=music";
-        
-        std::vector<uint8_t> jsonBytes;
-        if (HttpGetBinary(searchUrl, jsonBytes, 512 * 1024)) {
-            const std::string json(jsonBytes.begin(), jsonBytes.end());
-            std::wstring artworkUrl = ExtractFirstJsonStringValue(json, "artworkUrl100");
-            if (artworkUrl.empty()) {
-                artworkUrl = ExtractFirstJsonStringValue(json, "artworkUrl60");
-            }
+    // On any failure the bitmap stays cleared and the island shows its
+    // placeholder. Keep exceptions inside this detached worker thread.
+    try {
+        std::wstring term = ctx->artist.empty() ? ctx->title : (ctx->artist + L" " + ctx->title);
+        if (!term.empty()) {
+            const std::wstring searchUrl =
+                L"https://itunes.apple.com/search?term=" + PercentEncodeUtf8(term) +
+                L"&entity=song&limit=1&media=music";
             
-            if (!artworkUrl.empty()) {
-                std::vector<uint8_t> imageBytes;
-                if (HttpGetBinary(artworkUrl, imageBytes, 10 * 1024 * 1024)) {
-                    uint32_t width = 0, height = 0;
-                    std::vector<uint8_t> pbgraPixels;
-                    if (DecodeBytesToPBGRA(imageBytes.data(), imageBytes.size(), width, height, pbgraPixels)) {
-                        self->StoreDecodedThumbnail(std::move(pbgraPixels), width, height, ctx->trackId);
+            std::vector<uint8_t> jsonBytes;
+            if (HttpGetBinary(searchUrl, jsonBytes, 512 * 1024)) {
+                const std::string json(jsonBytes.begin(), jsonBytes.end());
+                std::wstring artworkUrl = ExtractFirstJsonStringValue(json, "artworkUrl100");
+                if (artworkUrl.empty()) {
+                    artworkUrl = ExtractFirstJsonStringValue(json, "artworkUrl60");
+                }
+                
+                if (!artworkUrl.empty()) {
+                    std::vector<uint8_t> imageBytes;
+                    if (HttpGetBinary(artworkUrl, imageBytes, 10 * 1024 * 1024)) {
+                        uint32_t width = 0, height = 0;
+                        std::vector<uint8_t> pbgraPixels;
+                        if (DecodeBytesToPBGRA(imageBytes.data(), imageBytes.size(), width, height, pbgraPixels)) {
+                            self->StoreDecodedThumbnail(std::move(pbgraPixels), width, height, ctx->trackId);
+                        }
                     }
                 }
             }
         }
+    } catch (const std::exception&) {
+        LogError(L"Online artwork lookup failed (C++ exception)");
+    } catch (...) {
+        LogError(L"Online artwork lookup failed (unknown exception)");
     }
     
     self->m_isFetchingItunes = false;
@@ -5236,17 +5285,36 @@ DWORD WINAPI MediaService::PollThreadProcStatic(LPVOID param) {
 #if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
 
 void MediaService::PollThreadProcInternal() {
-    const HRESULT comInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(comInitHr)) {
-        LogError(L"MediaService COM initialization failed (HRESULT=0x%08X)", static_cast<unsigned>(comInitHr));
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (const winrt::hresult_error& e) {
+        LogError(L"MediaService WinRT initialization failed (HRESULT=0x%08X): %s",
+                 static_cast<unsigned>(e.code()), e.message().c_str());
+        m_isRunning = false;
+        return;
+    } catch (...) {
+        LogError(L"MediaService WinRT initialization failed (unknown error)");
         m_isRunning = false;
         return;
     }
 
+    ULONGLONG lastErrorLogTick = 0;
     while (!m_pollStop && m_isRunning) {
         try {
             if (!m_sessionManager) {
-                m_sessionManager = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+                auto requestOperation = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
+                if (requestOperation.wait_for(std::chrono::seconds(5)) ==
+                    winrt::Windows::Foundation::AsyncStatus::Completed) {
+                    m_sessionManager = requestOperation.GetResults();
+                    LogInfo(L"GSMTC session manager acquired");
+                } else {
+                    requestOperation.Cancel();
+                    const ULONGLONG nowTick = GetTickCount64();
+                    if (nowTick - lastErrorLogTick >= 5000) {
+                        LogError(L"GSMTC RequestAsync did not complete within 5 seconds");
+                        lastErrorLogTick = nowTick;
+                    }
+                }
             }
             
             if (m_sessionManager) {
@@ -5292,7 +5360,13 @@ void MediaService::PollThreadProcInternal() {
                 }
                 
                 if (session) {
-                    auto props = session.TryGetMediaPropertiesAsync().get();
+                    auto propertiesOperation = session.TryGetMediaPropertiesAsync();
+                    if (propertiesOperation.wait_for(std::chrono::seconds(5)) !=
+                        winrt::Windows::Foundation::AsyncStatus::Completed) {
+                        propertiesOperation.Cancel();
+                        throw winrt::hresult_error(HRESULT_FROM_WIN32(WAIT_TIMEOUT));
+                    }
+                    auto props = propertiesOperation.GetResults();
                     auto info = session.GetPlaybackInfo();
                     auto timeline = session.GetTimelineProperties();
                     
@@ -5359,10 +5433,16 @@ void MediaService::PollThreadProcInternal() {
                         }
                     } else {
                         std::lock_guard<std::mutex> lock(m_thumbMutex);
-                        if (m_state.isPlaying) {
-                            m_state.isPlaying = false;
-                            m_stateDirty = true;
-                        }
+                        const bool hadMedia = m_hasRealSession || m_state.isPlaying ||
+                                              !m_state.title.empty() || !m_state.artist.empty();
+                        m_hasRealSession = false;
+                        m_state.isPlaying = false;
+                        m_state.title.clear();
+                        m_state.artist.clear();
+                        m_state.progress = 0.0f;
+                        m_state.elapsedSeconds = 0;
+                        m_state.durationSeconds = 0;
+                        if (hadMedia) m_stateDirty = true;
                     }
                 } else {
                     bool wasActive;
@@ -5391,22 +5471,59 @@ void MediaService::PollThreadProcInternal() {
                     }
                 }
             }
+        } catch (const winrt::hresult_error& e) {
+            const ULONGLONG nowTick = GetTickCount64();
+            if (nowTick - lastErrorLogTick >= 5000) {
+                LogError(L"GSMTC polling failed (HRESULT=0x%08X): %s",
+                         static_cast<unsigned>(e.code()), e.message().c_str());
+                lastErrorLogTick = nowTick;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_thumbMutex);
+                m_hasRealSession = false;
+                m_state.isPlaying = false;
+                m_stateDirty = true;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_sessionMutex);
+                m_currentSession = nullptr;
+            }
+            m_sessionManager = nullptr;
         } catch (...) {
-            std::lock_guard<std::mutex> lock(m_thumbMutex);
-            m_hasRealSession = false;
-            m_state.isPlaying = false;
-            m_stateDirty = true;
+            const ULONGLONG nowTick = GetTickCount64();
+            if (nowTick - lastErrorLogTick >= 5000) {
+                LogError(L"GSMTC polling failed (unknown exception)");
+                lastErrorLogTick = nowTick;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_thumbMutex);
+                m_hasRealSession = false;
+                m_state.isPlaying = false;
+                m_stateDirty = true;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_sessionMutex);
+                m_currentSession = nullptr;
+            }
+            m_sessionManager = nullptr;
         }
         
         Sleep(500);
     }
     
-    if (SUCCEEDED(comInitHr)) CoUninitialize();
+    {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        m_currentSession = nullptr;
+    }
+    m_sessionManager = nullptr;
+    winrt::uninit_apartment();
 }
 
 #else
 
 void MediaService::PollThreadProcInternal() {
+    LogError(L"Media detection is unavailable: required C++/WinRT GSMTC headers were not found at build time");
+    m_isRunning = false;
 }
 
 #endif
@@ -6042,15 +6159,27 @@ void PowerService::Start() {
     if (m_isRunning) return;
     m_isRunning = true;
     m_lastPollTick = 0;
+    m_hasKnownACStatus = false;
+    m_lowBatteryAlerted = false;
     
-    SYSTEM_POWER_STATUS sps;
+    SYSTEM_POWER_STATUS sps{};
     if (GetSystemPowerStatus(&sps)) {
-        m_batteryPercent = sps.BatteryLifePercent;
-        m_isACConnected = (sps.ACLineStatus == 1);
-        m_wasACConnected = m_isACConnected;
+        if (sps.BatteryLifePercent <= 100) {
+            m_batteryPercent = sps.BatteryLifePercent;
+        }
+        if (sps.ACLineStatus != 255) {
+            m_isACConnected = (sps.ACLineStatus == 1);
+            m_wasACConnected = m_isACConnected;
+            m_hasKnownACStatus = true;
+        }
     }
     
-    LogInfo(L"PowerService started (AC=%d, Battery=%d%%)", m_isACConnected, m_batteryPercent);
+    const std::wstring batteryLog = m_batteryPercent <= 100
+        ? std::to_wstring(m_batteryPercent) + L"%"
+        : L"unknown";
+    LogInfo(L"PowerService started (AC=%s, Battery=%s)",
+            m_hasKnownACStatus ? (m_isACConnected ? L"connected" : L"disconnected") : L"unknown",
+            batteryLog.c_str());
 }
 
 void PowerService::Stop() {
@@ -6063,41 +6192,48 @@ void PowerService::Poll() {
     if (m_lastPollTick != 0 && now - m_lastPollTick < 1000) return;
     m_lastPollTick = now;
 
-    SYSTEM_POWER_STATUS sps;
+    SYSTEM_POWER_STATUS sps{};
     if (!GetSystemPowerStatus(&sps)) return;
-    
-    bool currentAC = (sps.ACLineStatus == 1);
-    BYTE currentPercent = sps.BatteryLifePercent;
-    
-    if (currentAC != m_wasACConnected) {
+
+    const bool hasACStatus = (sps.ACLineStatus != 255);
+    const bool currentAC = (sps.ACLineStatus == 1);
+    const bool hasBatteryPercent = (sps.BatteryLifePercent <= 100);
+    const BYTE currentPercent = sps.BatteryLifePercent;
+
+    if (hasACStatus) {
+        if (m_hasKnownACStatus && currentAC != m_wasACConnected) {
+            if (GetSettingsSnapshot().enablePowerHUD) {
+                QueuedEvent qe;
+                qe.type = EventType::Power;
+                qe.durationMs = DURATION_POWER_MS;
+                qe.title = currentAC ? L"Charging" : L"On battery";
+                qe.progressPercent = hasBatteryPercent ? static_cast<int>(currentPercent) : -1;
+                m_manager->PostTransientEvent(qe);
+            }
+        }
         m_wasACConnected = currentAC;
         m_isACConnected = currentAC;
-        
-        if (GetSettingsSnapshot().enablePowerHUD && currentAC) {
-            QueuedEvent qe;
-            qe.type = EventType::Power;
-            qe.durationMs = DURATION_POWER_MS;
-            qe.title = L"Charging";
-            qe.progressPercent = currentPercent;
-            m_manager->PostTransientEvent(qe);
-        }
+        m_hasKnownACStatus = true;
     }
-    
-    if (!currentAC && currentPercent <= 20 && !m_lowBatteryAlerted) {
+
+    if (hasBatteryPercent && m_hasKnownACStatus && !m_isACConnected &&
+        currentPercent <= 20 && !m_lowBatteryAlerted) {
         m_lowBatteryAlerted = true;
         if (GetSettingsSnapshot().enablePowerHUD) {
             QueuedEvent qe;
             qe.type = EventType::LowBattery;
             qe.durationMs = DURATION_LOW_BATT_MS;
             qe.title = L"Low Battery";
-            qe.progressPercent = currentPercent;
+            qe.progressPercent = static_cast<int>(currentPercent);
             m_manager->PostTransientEvent(qe);
         }
-    } else if (currentPercent > 25) {
+    } else if (hasBatteryPercent && currentPercent > 25) {
         m_lowBatteryAlerted = false;
     }
-    
-    m_batteryPercent = currentPercent;
+
+    if (hasBatteryPercent) {
+        m_batteryPercent = currentPercent;
+    }
 }
 } // namespace Services
 } // namespace DynamicIsland
@@ -6497,12 +6633,27 @@ void LoadSettings() {
 }
 
 static DWORD WINAPI IslandUIThreadProc(LPVOID) {
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
+    try {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+    } catch (const winrt::hresult_error& e) {
+        LogError(L"UI thread WinRT initialization failed (HRESULT=0x%08X): %s",
+                 static_cast<unsigned>(e.code()), e.message().c_str());
+        if (g_uiReadyEvent) SetEvent(g_uiReadyEvent);
+        return 0;
+    } catch (...) {
+        LogError(L"UI thread WinRT initialization failed (unknown error)");
+        if (g_uiReadyEvent) SetEvent(g_uiReadyEvent);
+        return 0;
+    }
+#else
     const HRESULT uiComInitHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(uiComInitHr)) {
         LogError(L"UI thread COM initialization failed (HRESULT=0x%08X)", static_cast<unsigned>(uiComInitHr));
         if (g_uiReadyEvent) SetEvent(g_uiReadyEvent);
         return 0;
     }
+#endif
 
     g_islandWindow = std::make_unique<Overlay::IslandWindow>();
     if (!g_islandWindow->Create()) {
@@ -6510,7 +6661,11 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
         g_islandWindow->Destroy();
         g_islandWindow.reset();
         if (g_uiReadyEvent) SetEvent(g_uiReadyEvent);
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
+        winrt::uninit_apartment();
+#else
         CoUninitialize();
+#endif
         return 0;
     }
     
@@ -6643,7 +6798,11 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
         g_islandWindow.reset();
     }
     
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
+    winrt::uninit_apartment();
+#else
     CoUninitialize();
+#endif
     return 0;
 }
 } // namespace DynamicIsland
