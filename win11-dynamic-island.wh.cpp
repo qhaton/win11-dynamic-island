@@ -2,7 +2,7 @@
 // @id              win11-dynamic-island
 // @name            Dynamic Island for Windows 11
 // @description     An interactive Dynamic Island overlay and taskbar companion for Windows 11
-// @version         0.1.5
+// @version         0.1.17
 // @author          Tederby and Qhaton
 // @github          https://github.com/qhaton
 // @include         explorer.exe
@@ -81,18 +81,15 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 - autoCollapseDelayMs: 1500
   $name: Auto-collapse Delay (ms)
   $description: Milliseconds of inactivity after cursor leaves before an expanded island collapses back to compact view (1500ms = 1.5s).
-- animationSpeed: 1.0
-  $name: Animation Speed Multiplier
-  $description: Adjust speed of spring transition animations (1.0 = default fluid physics).
 - enableDebugHotkeys: true
   $name: Enable Debug Hotkeys
   $description: Enable global hotkeys (Ctrl+Win+1..9, 0) to simulate volume, battery, media, and other HUD events.
 - fontFamily: Segoe UI Variable Text
   $name: Font Family
   $description: Custom font family name (e.g. "Inter", "Segoe UI Variable Text", "Segoe UI"). "Segoe UI Variable Text" is the Windows 11 default with proportional digits; if the named font is not installed, the mod falls back to Segoe UI Variable / Segoe UI automatically.
-- fontWeightRegular: regular
+- fontWeightRegular: medium
   $name: Body Font Weight
-  $description: Unused since v0.1.3 — all text now renders with the Emphasis Font Weight so every label and digit matches the compact track title typography.
+  $description: Font weight used by normal body text and secondary labels.
   $options:
     - thin: Thin (100) — very light, only for large display text
     - light: Light (300) — airy and elegant
@@ -100,9 +97,9 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
     - medium: Medium (500) — recommended modern UI weight, balances readability and elegance
     - semibold: Semi Bold (600) — stronger emphasis
     - bold: Bold (700) — heaviest, maximum emphasis
-- fontWeightBold: medium
+- fontWeightBold: bold
   $name: Emphasis Font Weight
-  $description: Font weight used for ALL text (track titles, HUD labels, digits, timer). Applied uniformly since v0.1.3.
+  $description: Font weight used by emphasized text, including media track titles and highlighted labels.
   $options:
     - thin: Thin (100)
     - light: Light (300)
@@ -127,6 +124,7 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 #include <windows.h>
 #include <algorithm>
 #include <condition_variable>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <memory>
@@ -281,10 +279,9 @@ struct ModSettings {
     bool enableBluetoothHUD = true;
     bool enableDebugHotkeys = true;
     int autoCollapseDelayMs = 1500;
-    float animationSpeed = 1.0f;
     std::wstring fontFamily = L"Segoe UI Variable Text";
-    FontWeightPreset fontWeightRegular = FontWeightPreset::Regular;
-    FontWeightPreset fontWeightBold = FontWeightPreset::Medium;
+    FontWeightPreset fontWeightRegular = FontWeightPreset::Medium;
+    FontWeightPreset fontWeightBold = FontWeightPreset::Bold;
     int fontSizeRegular = 12;
     int fontSizeBig = 32;
     int fontSizeSmall = 11;
@@ -427,7 +424,8 @@ enum class IconType {
     Bolt,
     Bluetooth,
     Battery,
-    Checkmark
+    Checkmark,
+    BatteryHorizontal
 };
 
 void DrawIcon(
@@ -469,18 +467,16 @@ public:
     void DrawProgressBar(const D2D1_RECT_F& barRect, float progressFraction, D2D1_COLOR_F bgColor, D2D1_COLOR_F fgColor);
     void DrawProgressRing(D2D1_POINT_2F center, float radius, float progressFraction, D2D1_COLOR_F ringColor, float strokeWidth = 2.0f);
     void DrawStatusDot(D2D1_POINT_2F center, float radius, D2D1_COLOR_F color);
-    void DrawEqualizerWaves(D2D1_POINT_2F origin, float height, float lowBand, float midBand, float highBand, bool playing);
+    void DrawEqualizerWaves(D2D1_POINT_2F origin, float height, const float* bands, bool playing);
     void DrawAlbumArt(const D2D1_RECT_F& bounds, float cornerRadius, float rotationDegrees = 0.0f);
     void SetAlbumArtBitmap(const uint8_t* pixels, UINT width, UINT height);
     void ClearAlbumArtBitmap();
     bool HasAlbumArtBitmap() const { return m_albumArtBitmap != nullptr; }
     void DrawIconImage(IconType type, const D2D1_RECT_F& bounds, D2D1_COLOR_F color);
     void DrawButtonPill(const D2D1_RECT_F& bounds, const std::wstring& text, bool isHovered);
-    void DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, bool isHovered);
+    void DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, bool isHovered, float iconScale = 1.0f);
     
     ID2D1RenderTarget* GetRenderTarget() const { return m_dcRenderTarget.Get(); }
-    ID2D1Factory* GetFactory() const { return m_d2dFactory.Get(); }
-    IDWriteFactory* GetDWriteFactory() const { return m_dwriteFactory.Get(); }
 
 private:
     HWND m_hwnd = nullptr;
@@ -664,15 +660,12 @@ private:
     TimerState m_prevTimerState;
     
     bool m_isHovered = false;
-    float m_waveProgress = 0.0f;
     float m_marqueeOffset = 0.0f;
     float m_albumArtRotation = 0.0f;
     
     // Per-frame smoothed equalizer bands so the compact bars glide smoothly
     // between the ~200 ms audio service polls instead of jumping.
-    float m_eqLowSmooth = 0.0f;
-    float m_eqMidSmooth = 0.0f;
-    float m_eqHighSmooth = 0.0f;
+    float m_eqBandSmooth[6]{};
     double m_lastEqUpdateTimeMs = 0.0;
     
     double m_lastMarqueeTimeMs = 0.0;
@@ -708,12 +701,20 @@ private:
     bool m_isSeeking = false;
     float m_seekProgress = 0.0f;
     
+    // Interactive volume scrubbing (compact volume pill)
+    bool m_isVolumeDragging = false;
+    float m_volumeDragFraction = 0.0f;
+    double m_volumeDragEndTimeMs = 0.0;
+    
     void ArmAutoCollapse();
     void DisarmAutoCollapse();
     void OnClick(int clientX, int clientY);
     bool TryBeginSeek(float localX, float localY, float w, float h);
     void UpdateSeekFromLocalX(float localX, float w);
     void EndSeek(bool commit);
+    bool TryBeginVolumeDrag(float localX, float localY, float w, float h);
+    void UpdateVolumeDragFromLocalX(float localX, float w);
+    void EndVolumeDrag();
     void CheckTaskbarGeometry();
     bool IsPointInSquircle(float clientX, float clientY) const;
     void UpdateEqualizerSmoothing();
@@ -741,9 +742,8 @@ struct QueuedEvent {
 };
 
 struct EqBands {
-    float low = 0.0f;
-    float mid = 0.0f;
-    float high = 0.0f;
+    // Six independent frequency ranges, ordered from bass to treble.
+    float values[6]{};
 };
 
 class ServiceManager {
@@ -772,10 +772,10 @@ public:
     void OnMediaPrev();
     void OnMediaNext();
     void OnMediaSeek(float progressFraction);
+    void OnVolumeScrub(float volumeFraction);
     void OnTimerTogglePause();
     void OnTimerStop();
     
-    void CycleDemoScenario();
     void TriggerTestScenario(int index);
     void FireTransient(EventType type);
     void RefreshVisibility();
@@ -795,6 +795,10 @@ private:
     bool m_mediaActive = false;
     bool m_timerActive = false;
     bool m_micActive = false;
+
+    // Return the island to idle five seconds after media playback is paused.
+    ULONGLONG m_mediaPausedSinceTick = 0;
+    bool m_mediaPauseExpired = false;
     
     int m_demoIndex = 0;
     std::wstring m_lastTrackTitle;
@@ -944,17 +948,15 @@ public:
     void Stop();
     void CheckMicUsage();
     void PollVolume();
+    void SetVolume(float volume);
     void UpdateLoopback();
     void StopLoopbackCapture();
     
     float GetCurrentVolume() const { return m_currentVolume; }
     bool IsMuted() const { return m_isMuted; }
     bool IsMicInUse() const { return m_isMicInUse; }
-    float GetCurrentAmplitude() const { return m_smoothedRms; }
     
-    float GetLowBand()  const { return m_lowBandSmooth; }
-    float GetMidBand()  const { return m_midBandSmooth; }
-    float GetHighBand() const { return m_highBandSmooth; }
+    float GetBand(size_t index) const { return index < 6 ? m_bandSmooth[index] : 0.0f; }
 
 private:
     [[maybe_unused]] ServiceManager* m_manager = nullptr;
@@ -973,14 +975,16 @@ private:
     WAVEFORMATEX* m_pwfx = nullptr;
     bool m_isLoopbackActive = false;
     
-    float m_currentRms = 0.0f;
-    float m_smoothedRms = 0.0f;
     
-    float m_lpState = 0.0f;
-    float m_midLpState = 0.0f;
-    float m_lowBandSmooth  = 0.0f;
-    float m_midBandSmooth  = 0.0f;
-    float m_highBandSmooth = 0.0f;
+    struct BiquadBand {
+        float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+        float a1 = 0.0f, a2 = 0.0f;
+        float x1 = 0.0f, x2 = 0.0f;
+        float y1 = 0.0f, y2 = 0.0f;
+    };
+    BiquadBand m_eqFilters[6]{};
+    float m_eqFilterSampleRate = 0.0f;
+    float m_bandSmooth[6]{};
     float m_lastReportedVolume = -1.0f;
     bool m_lastReportedMute = false;
     bool m_hasReportedVolume = false;
@@ -1107,9 +1111,6 @@ public:
     
     bool IsActive() const { return m_isActive; }
     bool IsPaused() const { return m_isPaused; }
-    int GetRemainingSeconds() const { return m_remainingSeconds; }
-    int GetTotalSeconds() const { return m_totalSeconds; }
-    float GetProgressFraction() const;
 
 private:
     ServiceManager* m_manager = nullptr;
@@ -1373,6 +1374,14 @@ void AnimatedValue::Update(double currentTimeMs) {
 // ============================================================================
 // [Module] src\graphics\icons.cpp
 // ============================================================================
+// Icon glyphs are rendered from vector path data derived from Google's
+// Material Symbols (Rounded style, weight 400), licensed under the Apache
+// License, Version 2.0. The original SVG path data (viewBox "0 -960 960 960")
+// was pre-converted into a 24-unit grid with absolute line/cubic segments and
+// knock-out subpaths removed, so each glyph renders as a solid, rounded shape
+// similar to the filled iOS (SF Symbols) look. Being pure geometry, the icons
+// stay crisp at any DPI and are tinted by the caller's brush color.
+// License note: https://www.apache.org/licenses/LICENSE-2.0
 namespace DynamicIsland {
 namespace Graphics {
 
@@ -1390,84 +1399,414 @@ inline D2D1_POINT_2F Pt(float x, float y, const D2D1_RECT_F& bounds) {
     return D2D1::Point2F(ScaleX(x, bounds), ScaleY(y, bounds));
 }
 
-// A shared stroke style with round joins/caps: combined with a fill it rounds
-// every corner of an icon polygon, matching the iOS (SF Symbols) look.
-Microsoft::WRL::ComPtr<ID2D1StrokeStyle> CreateRoundStrokeStyle(ID2D1Factory* factory) {
-    Microsoft::WRL::ComPtr<ID2D1StrokeStyle> style;
-    if (!factory) return style;
-    
-    D2D1_STROKE_STYLE_PROPERTIES props{};
-    props.lineJoin = D2D1_LINE_JOIN_ROUND;
-    props.miterLimit = 10.0f;
-    props.startCap = D2D1_CAP_STYLE_ROUND;
-    props.endCap = D2D1_CAP_STYLE_ROUND;
-    props.dashCap = D2D1_CAP_STYLE_ROUND;
-    
-    factory->CreateStrokeStyle(&props, nullptr, 0, style.GetAddressOf());
-    return style;
-}
+enum IconSegKind { SEG_LINE, SEG_CUBIC, SEG_ARC };
 
-void DrawPolygon(
+struct IconSeg {
+    IconSegKind kind;
+    float ex, ey;                            // segment end (24-unit grid)
+    float c1x = 0.0f, c1y = 0.0f;            // cubic control point 1
+    float c2x = 0.0f, c2y = 0.0f;            // cubic control point 2
+    float rx = 0.0f, ry = 0.0f, rot = 0.0f;  // arc radii / rotation
+    uint8_t large = 0;                       // arc large-angle flag
+    uint8_t sweep = 0;                       // arc sweep flag (1 = clockwise)
+};
+
+struct IconFigure {
+    const IconSeg* segs;
+    size_t count;
+    D2D1_POINT_2F start;  // figure start point (24-unit grid)
+};
+
+struct IconGlyph {
+    const IconFigure* figures;
+    size_t count;
+};
+
+// --- play ---
+constexpr IconSeg kPLAYSegs[] = {
+    { SEG_CUBIC, 9.051f, 6.286f, 7.6f, 4.833f, 8.084f, 5.695f },
+    { SEG_LINE,  19.851f, 12.886f },
+    { SEG_CUBIC, 16.949f, 12.886f, 18.884f, 12.295f, 17.916f, 12.295f },
+    { SEG_LINE,  6.149f, 19.486f },
+    { SEG_CUBIC, 7.6f, 16.9f, 7.116f, 18.895f, 7.6f, 18.033f },
+};
+constexpr IconFigure kPLAYFigs[] = {
+    { kPLAYSegs, _countof(kPLAYSegs), { 7.6f, 3.7f } },
+};
+
+// --- pause ---
+constexpr IconSeg kPAUSESegs[] = {
+    { SEG_CUBIC, 7.2f, 5.0f, 6.2f, 5.333f, 6.533f, 5.0f },
+    { SEG_LINE,  9.2f, 5.0f },
+    { SEG_CUBIC, 10.2f, 6.0f, 9.867f, 5.0f, 10.2f, 5.333f },
+    { SEG_LINE,  10.2f, 18.0f },
+    { SEG_CUBIC, 9.2f, 19.0f, 10.2f, 18.667f, 9.867f, 19.0f },
+    { SEG_LINE,  7.2f, 19.0f },
+    { SEG_CUBIC, 6.2f, 18.0f, 6.533f, 19.0f, 6.2f, 18.667f },
+};
+constexpr IconSeg kPAUSESegs1[] = {
+    { SEG_CUBIC, 14.8f, 5.0f, 13.8f, 5.333f, 14.133f, 5.0f },
+    { SEG_LINE,  16.8f, 5.0f },
+    { SEG_CUBIC, 17.8f, 6.0f, 17.467f, 5.0f, 17.8f, 5.333f },
+    { SEG_LINE,  17.8f, 18.0f },
+    { SEG_CUBIC, 16.8f, 19.0f, 17.8f, 18.667f, 17.467f, 19.0f },
+    { SEG_LINE,  14.8f, 19.0f },
+    { SEG_CUBIC, 13.8f, 18.0f, 14.133f, 19.0f, 13.8f, 18.667f },
+};
+constexpr IconFigure kPAUSEFigs[] = {
+    { kPAUSESegs, _countof(kPAUSESegs), { 6.2f, 6.0f } },
+    { kPAUSESegs1, _countof(kPAUSESegs1), { 13.8f, 6.0f } },
+};
+
+// --- next ---
+constexpr IconSeg kNEXTSegs[] = {
+    { SEG_CUBIC, 5.056f, 5.881f, 4.1f, 5.433f, 4.419f, 5.294f },
+    { SEG_LINE,  10.744f, 11.119f },
+    { SEG_CUBIC, 10.744f, 12.881f, 11.381f, 11.706f, 11.381f, 12.294f },
+    { SEG_LINE,  5.056f, 18.119f },
+    { SEG_CUBIC, 4.1f, 17.7f, 4.419f, 18.706f, 4.1f, 18.567f },
+};
+constexpr IconSeg kNEXTSegs1[] = {
+    { SEG_CUBIC, 13.256f, 5.881f, 12.3f, 5.433f, 12.619f, 5.294f },
+    { SEG_LINE,  18.944f, 11.119f },
+    { SEG_CUBIC, 18.944f, 12.881f, 19.581f, 11.706f, 19.581f, 12.294f },
+    { SEG_LINE,  13.256f, 18.119f },
+    { SEG_CUBIC, 12.3f, 17.7f, 12.619f, 18.706f, 12.3f, 18.567f },
+};
+constexpr IconFigure kNEXTFigs[] = {
+    { kNEXTSegs, _countof(kNEXTSegs), { 4.1f, 6.3f } },
+    { kNEXTSegs1, _countof(kNEXTSegs1), { 12.3f, 6.3f } },
+};
+
+// --- prev ---
+constexpr IconSeg kPREVSegs[] = {
+    { SEG_CUBIC, 10.744f, 5.881f, 11.7f, 5.433f, 11.381f, 5.294f },
+    { SEG_LINE,  5.056f, 11.119f },
+    { SEG_CUBIC, 5.056f, 12.881f, 4.419f, 11.706f, 4.419f, 12.294f },
+    { SEG_LINE,  10.744f, 18.119f },
+    { SEG_CUBIC, 11.7f, 17.7f, 11.381f, 18.706f, 11.7f, 18.567f },
+};
+constexpr IconSeg kPREVSegs1[] = {
+    { SEG_CUBIC, 18.944f, 5.881f, 19.9f, 5.433f, 19.581f, 5.294f },
+    { SEG_LINE,  13.256f, 11.119f },
+    { SEG_CUBIC, 13.256f, 12.881f, 12.619f, 11.706f, 12.619f, 12.294f },
+    { SEG_LINE,  18.944f, 18.119f },
+    { SEG_CUBIC, 19.9f, 17.7f, 19.581f, 18.706f, 19.9f, 18.567f },
+};
+constexpr IconFigure kPREVFigs[] = {
+    { kPREVSegs, _countof(kPREVSegs), { 11.7f, 6.3f } },
+    { kPREVSegs1, _countof(kPREVSegs1), { 19.9f, 6.3f } },
+};
+
+// --- volume ---
+constexpr IconSeg kVOLUMESegs[] = {
+    { SEG_CUBIC, 17.9f, 8.188f, 19.0f, 10.592f, 18.633f, 9.329f },
+    { SEG_CUBIC, 14.95f, 5.625f, 17.167f, 7.046f, 16.183f, 6.192f },
+    { SEG_CUBIC, 14.4f, 5.088f, 14.7f, 5.508f, 14.517f, 5.329f },
+    { SEG_CUBIC, 14.35f, 4.35f, 14.283f, 4.846f, 14.267f, 4.6f },
+    { SEG_CUBIC, 14.888f, 3.775f, 14.45f, 4.083f, 14.629f, 3.892f },
+    { SEG_CUBIC, 15.675f, 3.775f, 15.146f, 3.658f, 15.408f, 3.658f },
+    { SEG_CUBIC, 19.55f, 7.063f, 17.292f, 4.492f, 18.583f, 5.588f },
+    { SEG_CUBIC, 21.0f, 11.975f, 20.517f, 8.538f, 21.0f, 10.175f },
+    { SEG_CUBIC, 19.55f, 16.888f, 21.0f, 13.775f, 20.517f, 15.413f },
+    { SEG_CUBIC, 15.675f, 20.175f, 18.583f, 18.363f, 17.292f, 19.458f },
+    { SEG_CUBIC, 14.888f, 20.175f, 15.408f, 20.292f, 15.146f, 20.292f },
+    { SEG_CUBIC, 14.35f, 19.6f, 14.629f, 20.058f, 14.45f, 19.867f },
+    { SEG_CUBIC, 14.4f, 18.863f, 14.267f, 19.35f, 14.283f, 19.104f },
+    { SEG_CUBIC, 14.95f, 18.325f, 14.517f, 18.621f, 14.7f, 18.442f },
+    { SEG_CUBIC, 17.9f, 15.763f, 16.183f, 17.758f, 17.167f, 16.904f },
+    { SEG_CUBIC, 19.0f, 11.975f, 18.633f, 14.621f, 19.0f, 13.358f },
+};
+constexpr IconSeg kVOLUMESegs1[] = {
+    { SEG_LINE,  4.0f, 15.0f },
+    { SEG_CUBIC, 3.288f, 14.713f, 3.717f, 15.0f, 3.479f, 14.904f },
+    { SEG_CUBIC, 3.0f, 14.0f, 3.096f, 14.521f, 3.0f, 14.283f },
+    { SEG_LINE,  3.0f, 10.0f },
+    { SEG_CUBIC, 3.288f, 9.288f, 3.0f, 9.717f, 3.096f, 9.479f },
+    { SEG_CUBIC, 4.0f, 9.0f, 3.479f, 9.096f, 3.717f, 9.0f },
+    { SEG_LINE,  7.0f, 9.0f },
+    { SEG_LINE,  10.3f, 5.7f },
+    { SEG_CUBIC, 11.388f, 5.488f, 10.617f, 5.383f, 10.979f, 5.313f },
+    { SEG_CUBIC, 12.0f, 6.425f, 11.796f, 5.663f, 12.0f, 5.975f },
+    { SEG_LINE,  12.0f, 17.575f },
+    { SEG_CUBIC, 11.388f, 18.513f, 12.0f, 18.025f, 11.796f, 18.338f },
+    { SEG_CUBIC, 10.3f, 18.3f, 10.979f, 18.688f, 10.617f, 18.617f },
+    { SEG_LINE,  7.0f, 15.0f },
+};
+constexpr IconSeg kVOLUMESegs2[] = {
+    { SEG_CUBIC, 16.025f, 13.988f, 16.5f, 12.7f, 16.342f, 13.363f },
+    { SEG_CUBIC, 14.775f, 15.525f, 15.708f, 14.613f, 15.292f, 15.125f },
+    { SEG_CUBIC, 14.263f, 15.538f, 14.608f, 15.625f, 14.438f, 15.629f },
+    { SEG_CUBIC, 14.0f, 15.1f, 14.088f, 15.446f, 14.0f, 15.3f },
+    { SEG_LINE,  14.0f, 8.85f },
+    { SEG_CUBIC, 14.263f, 8.413f, 14.0f, 8.65f, 14.088f, 8.504f },
+    { SEG_CUBIC, 14.775f, 8.425f, 14.438f, 8.321f, 14.608f, 8.325f },
+    { SEG_CUBIC, 16.025f, 10.0f, 15.292f, 8.842f, 15.708f, 9.367f },
+    { SEG_CUBIC, 16.5f, 12.0f, 16.342f, 10.633f, 16.5f, 11.3f },
+};
+constexpr IconFigure kVOLUMEFigs[] = {
+    { kVOLUMESegs, _countof(kVOLUMESegs), { 19.0f, 11.975f } },
+    { kVOLUMESegs1, _countof(kVOLUMESegs1), { 7.0f, 15.0f } },
+    { kVOLUMESegs2, _countof(kVOLUMESegs2), { 16.5f, 12.0f } },
+};
+
+// --- capslock ---
+constexpr IconSeg kCAPSLOCKSegs[] = {
+    { SEG_CUBIC, 6.288f, 17.713f, 6.717f, 18.0f, 6.479f, 17.904f },
+    { SEG_CUBIC, 6.0f, 17.0f, 6.096f, 17.521f, 6.0f, 17.283f },
+    { SEG_CUBIC, 6.288f, 16.288f, 6.0f, 16.717f, 6.096f, 16.479f },
+    { SEG_CUBIC, 7.0f, 16.0f, 6.479f, 16.096f, 6.717f, 16.0f },
+    { SEG_LINE,  17.0f, 16.0f },
+    { SEG_CUBIC, 17.713f, 16.288f, 17.283f, 16.0f, 17.521f, 16.096f },
+    { SEG_CUBIC, 18.0f, 17.0f, 17.904f, 16.479f, 18.0f, 16.717f },
+    { SEG_CUBIC, 17.713f, 17.713f, 18.0f, 17.283f, 17.904f, 17.521f },
+    { SEG_CUBIC, 17.0f, 18.0f, 17.521f, 17.904f, 17.283f, 18.0f },
+    { SEG_LINE,  7.0f, 18.0f },
+};
+constexpr IconSeg kCAPSLOCKSegs1[] = {
+    { SEG_LINE,  8.1f, 12.3f },
+    { SEG_CUBIC, 7.4f, 12.575f, 7.917f, 12.483f, 7.683f, 12.575f },
+    { SEG_CUBIC, 6.7f, 12.3f, 7.117f, 12.575f, 6.883f, 12.483f },
+    { SEG_CUBIC, 6.425f, 11.6f, 6.517f, 12.117f, 6.425f, 11.883f },
+    { SEG_CUBIC, 6.7f, 10.9f, 6.425f, 11.317f, 6.517f, 11.083f },
+    { SEG_LINE,  11.3f, 6.3f },
+    { SEG_CUBIC, 12.0f, 6.0f, 11.5f, 6.1f, 11.733f, 6.0f },
+    { SEG_CUBIC, 12.7f, 6.3f, 12.267f, 6.0f, 12.5f, 6.1f },
+    { SEG_LINE,  17.3f, 10.9f },
+    { SEG_CUBIC, 17.575f, 11.6f, 17.483f, 11.083f, 17.575f, 11.317f },
+    { SEG_CUBIC, 17.3f, 12.3f, 17.575f, 11.883f, 17.483f, 12.117f },
+    { SEG_CUBIC, 16.6f, 12.575f, 17.117f, 12.483f, 16.883f, 12.575f },
+    { SEG_CUBIC, 15.9f, 12.3f, 16.317f, 12.575f, 16.083f, 12.483f },
+    { SEG_LINE,  12.0f, 8.4f },
+};
+constexpr IconFigure kCAPSLOCKFigs[] = {
+    { kCAPSLOCKSegs, _countof(kCAPSLOCKSegs), { 7.0f, 18.0f } },
+    { kCAPSLOCKSegs1, _countof(kCAPSLOCKSegs1), { 12.0f, 8.4f } },
+};
+
+// --- bolt ---
+constexpr IconSeg kBOLTSegs[] = {
+    { SEG_LINE,  5.9f, 15.0f },
+    { SEG_CUBIC, 5.013f, 14.463f, 5.5f, 15.0f, 5.204f, 14.821f },
+    { SEG_CUBIC, 5.075f, 13.425f, 4.821f, 14.104f, 4.842f, 13.758f },
+    { SEG_LINE,  12.55f, 2.675f },
+    { SEG_CUBIC, 13.2f, 2.188f, 12.717f, 2.442f, 12.933f, 2.279f },
+    { SEG_CUBIC, 14.025f, 2.2f, 13.467f, 2.096f, 13.742f, 2.1f },
+    { SEG_CUBIC, 14.65f, 2.725f, 14.308f, 2.3f, 14.517f, 2.475f },
+    { SEG_CUBIC, 14.8f, 3.525f, 14.783f, 2.975f, 14.833f, 3.242f },
+    { SEG_LINE,  14.0f, 10.0f },
+    { SEG_LINE,  17.875f, 10.0f },
+    { SEG_CUBIC, 18.788f, 10.575f, 18.308f, 10.0f, 18.613f, 10.192f },
+    { SEG_CUBIC, 18.625f, 11.65f, 18.963f, 10.958f, 18.908f, 11.317f },
+    { SEG_LINE,  10.4f, 21.5f },
+    { SEG_CUBIC, 9.725f, 21.925f, 10.217f, 21.717f, 9.992f, 21.858f },
+    { SEG_CUBIC, 8.95f, 21.85f, 9.458f, 21.992f, 9.2f, 21.967f },
+    { SEG_CUBIC, 8.363f, 21.313f, 8.7f, 21.733f, 8.504f, 21.554f },
+    { SEG_CUBIC, 8.2f, 20.525f, 8.221f, 21.071f, 8.167f, 20.808f },
+    { SEG_LINE,  9.0f, 15.0f },
+};
+constexpr IconFigure kBOLTFigs[] = {
+    { kBOLTSegs, _countof(kBOLTSegs), { 9.0f, 15.0f } },
+};
+
+// --- bluetooth ---
+constexpr IconSeg kBLUETOOTHSegs[] = {
+    { SEG_LINE,  11.0f, 14.4f },
+    { SEG_LINE,  7.1f, 18.3f },
+    { SEG_CUBIC, 6.4f, 18.575f, 6.917f, 18.483f, 6.683f, 18.575f },
+    { SEG_CUBIC, 5.7f, 18.3f, 6.117f, 18.575f, 5.883f, 18.483f },
+    { SEG_CUBIC, 5.425f, 17.6f, 5.517f, 18.117f, 5.425f, 17.883f },
+    { SEG_CUBIC, 5.7f, 16.9f, 5.425f, 17.317f, 5.517f, 17.083f },
+    { SEG_LINE,  10.6f, 12.0f },
+    { SEG_LINE,  5.7f, 7.1f },
+    { SEG_CUBIC, 5.425f, 6.4f, 5.517f, 6.917f, 5.425f, 6.683f },
+    { SEG_CUBIC, 5.7f, 5.7f, 5.425f, 6.117f, 5.517f, 5.883f },
+    { SEG_CUBIC, 6.4f, 5.425f, 5.883f, 5.517f, 6.117f, 5.425f },
+    { SEG_CUBIC, 7.1f, 5.7f, 6.683f, 5.425f, 6.917f, 5.517f },
+    { SEG_LINE,  11.0f, 9.6f },
+    { SEG_LINE,  11.0f, 3.425f },
+    { SEG_CUBIC, 11.3f, 2.688f, 11.0f, 3.125f, 11.1f, 2.879f },
+    { SEG_CUBIC, 12.0f, 2.4f, 11.5f, 2.496f, 11.733f, 2.4f },
+    { SEG_CUBIC, 12.375f, 2.475f, 12.133f, 2.4f, 12.258f, 2.425f },
+    { SEG_CUBIC, 12.7f, 2.7f, 12.492f, 2.525f, 12.6f, 2.6f },
+    { SEG_LINE,  17.0f, 7.0f },
+    { SEG_CUBIC, 17.213f, 7.325f, 17.1f, 7.1f, 17.171f, 7.208f },
+    { SEG_CUBIC, 17.275f, 7.7f, 17.254f, 7.442f, 17.275f, 7.567f },
+    { SEG_CUBIC, 17.213f, 8.075f, 17.275f, 7.833f, 17.254f, 7.958f },
+    { SEG_CUBIC, 17.0f, 8.4f, 17.171f, 8.192f, 17.1f, 8.3f },
+    { SEG_LINE,  13.4f, 12.0f },
+    { SEG_LINE,  17.0f, 15.6f },
+    { SEG_CUBIC, 17.213f, 15.925f, 17.1f, 15.7f, 17.171f, 15.808f },
+    { SEG_CUBIC, 17.275f, 16.3f, 17.254f, 16.042f, 17.275f, 16.167f },
+    { SEG_CUBIC, 17.213f, 16.675f, 17.275f, 16.433f, 17.254f, 16.558f },
+    { SEG_CUBIC, 17.0f, 17.0f, 17.171f, 16.792f, 17.1f, 16.9f },
+    { SEG_LINE,  12.7f, 21.3f },
+    { SEG_CUBIC, 12.375f, 21.525f, 12.6f, 21.4f, 12.492f, 21.475f },
+    { SEG_CUBIC, 12.0f, 21.6f, 12.258f, 21.575f, 12.133f, 21.6f },
+    { SEG_CUBIC, 11.3f, 21.313f, 11.733f, 21.6f, 11.5f, 21.504f },
+    { SEG_CUBIC, 11.0f, 20.575f, 11.1f, 21.121f, 11.0f, 20.875f },
+};
+constexpr IconFigure kBLUETOOTHFigs[] = {
+    { kBLUETOOTHSegs, _countof(kBLUETOOTHSegs), { 11.0f, 20.575f } },
+};
+
+// --- battery ---
+constexpr IconSeg kBATTERYSegs[] = {
+    { SEG_CUBIC, 7.288f, 21.713f, 7.717f, 22.0f, 7.479f, 21.904f },
+    { SEG_CUBIC, 7.0f, 21.0f, 7.096f, 21.521f, 7.0f, 21.283f },
+    { SEG_LINE,  7.0f, 5.0f },
+    { SEG_CUBIC, 7.288f, 4.288f, 7.0f, 4.717f, 7.096f, 4.479f },
+    { SEG_CUBIC, 8.0f, 4.0f, 7.479f, 4.096f, 7.717f, 4.0f },
+    { SEG_LINE,  10.0f, 4.0f },
+    { SEG_LINE,  10.0f, 3.0f },
+    { SEG_CUBIC, 10.288f, 2.288f, 10.0f, 2.717f, 10.096f, 2.479f },
+    { SEG_CUBIC, 11.0f, 2.0f, 10.479f, 2.096f, 10.717f, 2.0f },
+    { SEG_LINE,  13.0f, 2.0f },
+    { SEG_CUBIC, 13.713f, 2.288f, 13.283f, 2.0f, 13.521f, 2.096f },
+    { SEG_CUBIC, 14.0f, 3.0f, 13.904f, 2.479f, 14.0f, 2.717f },
+    { SEG_LINE,  14.0f, 4.0f },
+    { SEG_LINE,  16.0f, 4.0f },
+    { SEG_CUBIC, 16.713f, 4.288f, 16.283f, 4.0f, 16.521f, 4.096f },
+    { SEG_CUBIC, 17.0f, 5.0f, 16.904f, 4.479f, 17.0f, 4.717f },
+    { SEG_LINE,  17.0f, 21.0f },
+    { SEG_CUBIC, 16.713f, 21.713f, 17.0f, 21.283f, 16.904f, 21.521f },
+    { SEG_CUBIC, 16.0f, 22.0f, 16.521f, 21.904f, 16.283f, 22.0f },
+    { SEG_LINE,  8.0f, 22.0f },
+};
+constexpr IconFigure kBATTERYFigs[] = {
+    { kBATTERYSegs, _countof(kBATTERYSegs), { 8.0f, 22.0f } },
+};
+
+// --- battery (horizontal) ---
+// Same solid battery glyph rotated to horizontal (cap on the right) by the
+// coordinate transform (x, y) -> (24 - y, x); matches the iOS charging pill.
+constexpr IconSeg kBATTERYHSegs[] = {
+    { SEG_CUBIC, 2.287f, 7.288f, 2.0f, 7.717f, 2.096f, 7.479f },
+    { SEG_CUBIC, 3.0f, 7.0f, 2.479f, 7.096f, 2.717f, 7.0f },
+    { SEG_LINE,  19.0f, 7.0f },
+    { SEG_CUBIC, 19.712f, 7.288f, 19.283f, 7.0f, 19.521f, 7.096f },
+    { SEG_CUBIC, 20.0f, 8.0f, 19.904f, 7.479f, 20.0f, 7.717f },
+    { SEG_LINE,  20.0f, 10.0f },
+    { SEG_LINE,  21.0f, 10.0f },
+    { SEG_CUBIC, 21.712f, 10.288f, 21.283f, 10.0f, 21.521f, 10.096f },
+    { SEG_CUBIC, 22.0f, 11.0f, 21.904f, 10.479f, 22.0f, 10.717f },
+    { SEG_LINE,  22.0f, 13.0f },
+    { SEG_CUBIC, 21.712f, 13.713f, 22.0f, 13.283f, 21.904f, 13.521f },
+    { SEG_CUBIC, 21.0f, 14.0f, 21.521f, 13.904f, 21.283f, 14.0f },
+    { SEG_LINE,  20.0f, 14.0f },
+    { SEG_LINE,  20.0f, 16.0f },
+    { SEG_CUBIC, 19.712f, 16.713f, 20.0f, 16.283f, 19.904f, 16.521f },
+    { SEG_CUBIC, 19.0f, 17.0f, 19.521f, 16.904f, 19.283f, 17.0f },
+    { SEG_LINE,  3.0f, 17.0f },
+    { SEG_CUBIC, 2.287f, 16.713f, 2.717f, 17.0f, 2.479f, 16.904f },
+    { SEG_CUBIC, 2.0f, 16.0f, 2.096f, 16.521f, 2.0f, 16.283f },
+    { SEG_LINE,  2.0f, 8.0f },
+};
+constexpr IconFigure kBATTERYHFigs[] = {
+    { kBATTERYHSegs, _countof(kBATTERYHSegs), { 2.0f, 8.0f } },
+};
+
+// --- check ---
+constexpr IconSeg kCHECKSegs[] = {
+    { SEG_LINE,  18.025f, 6.675f },
+    { SEG_CUBIC, 18.725f, 6.375f, 18.225f, 6.475f, 18.458f, 6.375f },
+    { SEG_CUBIC, 19.425f, 6.675f, 18.992f, 6.375f, 19.225f, 6.475f },
+    { SEG_CUBIC, 19.725f, 7.388f, 19.625f, 6.875f, 19.725f, 7.113f },
+    { SEG_CUBIC, 19.425f, 8.1f, 19.725f, 7.663f, 19.625f, 7.9f },
+    { SEG_LINE,  10.25f, 17.3f },
+    { SEG_CUBIC, 9.55f, 17.6f, 10.05f, 17.5f, 9.817f, 17.6f },
+    { SEG_CUBIC, 8.85f, 17.3f, 9.283f, 17.6f, 9.05f, 17.5f },
+    { SEG_LINE,  4.55f, 13.0f },
+    { SEG_CUBIC, 4.263f, 12.288f, 4.35f, 12.8f, 4.254f, 12.563f },
+    { SEG_CUBIC, 4.575f, 11.575f, 4.271f, 12.013f, 4.375f, 11.775f },
+    { SEG_CUBIC, 5.288f, 11.275f, 4.775f, 11.375f, 5.013f, 11.275f },
+    { SEG_CUBIC, 6.0f, 11.575f, 5.563f, 11.275f, 5.8f, 11.375f },
+    { SEG_LINE,  9.55f, 15.15f },
+};
+constexpr IconFigure kCHECKFigs[] = {
+    { kCHECKSegs, _countof(kCHECKSegs), { 9.55f, 15.15f } },
+};
+
+// Order matches the IconType enum declaration.
+const IconGlyph kGlyphs[] = {
+    { kPLAYFigs, _countof(kPLAYFigs) },        // Play
+    { kPAUSEFigs, _countof(kPAUSEFigs) },      // Pause
+    { kPREVFigs, _countof(kPREVFigs) },        // Previous
+    { kNEXTFigs, _countof(kNEXTFigs) },        // Next
+    { kVOLUMEFigs, _countof(kVOLUMEFigs) },    // Volume
+    { kCAPSLOCKFigs, _countof(kCAPSLOCKFigs) },// CapsLock
+    { kBOLTFigs, _countof(kBOLTFigs) },        // Bolt
+    { kBLUETOOTHFigs, _countof(kBLUETOOTHFigs) }, // Bluetooth
+    { kBATTERYFigs, _countof(kBATTERYFigs) },  // Battery
+    { kCHECKFigs, _countof(kCHECKFigs) },      // Checkmark
+    { kBATTERYHFigs, _countof(kBATTERYHFigs) },// BatteryHorizontal
+};
+
+void DrawIconGlyph(
     ID2D1RenderTarget* rt,
     ID2D1Factory* factory,
     ID2D1SolidColorBrush* brush,
-    const D2D1_POINT_2F* points,
-    UINT count
+    const IconGlyph& glyph,
+    const D2D1_RECT_F& bounds
 ) {
-    if (!rt || !factory || !brush || count < 3) return;
+    if (!rt || !factory || !brush || glyph.count == 0) return;
+
+    const float scaleX = (bounds.right - bounds.left) / 24.0f;
+    const float scaleY = (bounds.bottom - bounds.top) / 24.0f;
+
     Microsoft::WRL::ComPtr<ID2D1PathGeometry> path;
-    if (SUCCEEDED(factory->CreatePathGeometry(path.GetAddressOf()))) {
-        Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
-        if (SUCCEEDED(path->Open(sink.GetAddressOf()))) {
-            sink->BeginFigure(points[0], D2D1_FIGURE_BEGIN_FILLED);
-            sink->AddLines(&points[1], count - 1);
-            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink->Close();
-            
-            rt->FillGeometry(path.Get(), brush);
-            
-            // Stroke the same outline with a round join so sharp corners become
-            // rounded, matching filled iOS (SF Symbols) icons. The corner radius
-            // is proportional to the rendered icon size.
-            D2D1_RECT_F pathBounds{};
-            if (SUCCEEDED(path->GetBounds(nullptr, &pathBounds))) {
-                const float bw = pathBounds.right - pathBounds.left;
-                const float bh = pathBounds.bottom - pathBounds.top;
-                const float side = (bw < bh) ? bw : bh;
-                const float strokeW = side * 0.14f;
-                if (strokeW > 0.5f) {
-                    auto strokeStyle = CreateRoundStrokeStyle(factory);
-                    rt->DrawGeometry(path.Get(), brush, strokeW, strokeStyle.Get());
+    if (FAILED(factory->CreatePathGeometry(path.GetAddressOf()))) return;
+
+    Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(path->Open(sink.GetAddressOf()))) return;
+
+    for (size_t f = 0; f < glyph.count; ++f) {
+        const IconFigure& fig = glyph.figures[f];
+        if (!fig.segs || fig.count == 0) continue;
+
+        sink->BeginFigure(
+            D2D1::Point2F(ScaleX(fig.start.x, bounds), ScaleY(fig.start.y, bounds)),
+            D2D1_FIGURE_BEGIN_FILLED);
+
+        for (size_t i = 0; i < fig.count; ++i) {
+            const IconSeg& s = fig.segs[i];
+            const D2D1_POINT_2F end = Pt(s.ex, s.ey, bounds);
+
+            switch (s.kind) {
+                case SEG_LINE:
+                    sink->AddLine(end);
+                    break;
+                case SEG_CUBIC:
+                    sink->AddBezier(D2D1::BezierSegment(
+                        Pt(s.c1x, s.c1y, bounds),
+                        Pt(s.c2x, s.c2y, bounds),
+                        end));
+                    break;
+                case SEG_ARC: {
+                    D2D1_ARC_SEGMENT arc{};
+                    arc.point = end;
+                    arc.size = D2D1::SizeF(
+                        (std::max)(0.01f, s.rx * scaleX),
+                        (std::max)(0.01f, s.ry * scaleY));
+                    arc.rotationAngle = s.rot;
+                    arc.sweepDirection = s.sweep
+                        ? D2D1_SWEEP_DIRECTION_CLOCKWISE
+                        : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
+                    arc.arcSize = s.large ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
+                    sink->AddArc(arc);
+                    break;
                 }
             }
         }
+
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    }
+
+    if (SUCCEEDED(sink->Close())) {
+        rt->FillGeometry(path.Get(), brush);
     }
 }
 
-void DrawPolyline(
-    ID2D1RenderTarget* rt,
-    ID2D1Factory* factory,
-    ID2D1SolidColorBrush* brush,
-    const D2D1_POINT_2F* points,
-    UINT count,
-    float strokeWidth
-) {
-    if (!rt || !factory || !brush || count < 2) return;
-    Microsoft::WRL::ComPtr<ID2D1PathGeometry> path;
-    if (SUCCEEDED(factory->CreatePathGeometry(path.GetAddressOf()))) {
-        Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
-        if (SUCCEEDED(path->Open(sink.GetAddressOf()))) {
-            sink->BeginFigure(points[0], D2D1_FIGURE_BEGIN_HOLLOW);
-            sink->AddLines(&points[1], count - 1);
-            sink->EndFigure(D2D1_FIGURE_END_OPEN);
-            sink->Close();
-            // Round caps and joins give the open strokes (Bluetooth rune) the
-            // soft iOS look instead of flat, sharp ends.
-            auto strokeStyle = CreateRoundStrokeStyle(factory);
-            rt->DrawGeometry(path.Get(), brush, strokeWidth, strokeStyle.Get());
-        }
-    }
-}
 } // anonymous namespace
 
 void DrawIcon(
@@ -1479,150 +1818,10 @@ void DrawIcon(
     D2D1_COLOR_F color
 ) {
     if (!rt || !factory || !brush) return;
+    const size_t index = static_cast<size_t>(type);
+    if (index >= _countof(kGlyphs)) return;
     brush->SetColor(color);
-    
-    switch (type) {
-        case IconType::Play: {
-            // Filled iOS play triangle with rounded corners (round-join stroke
-            // in DrawPolygon softens the vertices).
-            D2D1_POINT_2F pts[] = {
-                Pt(8.2f, 5.6f, bounds),
-                Pt(8.2f, 18.4f, bounds),
-                Pt(18.4f, 12.0f, bounds)
-            };
-            DrawPolygon(rt, factory, brush, pts, 3);
-            break;
-        }
-        case IconType::Pause: {
-            // Two fully rounded vertical bars, like iOS "pause.fill".
-            D2D1_RECT_F r1 = D2D1::RectF(
-                ScaleX(6.0f, bounds), ScaleY(5.0f, bounds),
-                ScaleX(10.2f, bounds), ScaleY(19.0f, bounds)
-            );
-            D2D1_RECT_F r2 = D2D1::RectF(
-                ScaleX(13.8f, bounds), ScaleY(5.0f, bounds),
-                ScaleX(18.0f, bounds), ScaleY(19.0f, bounds)
-            );
-            const float barRadius = (bounds.right - bounds.left) * (1.5f / 24.0f);
-            rt->FillRoundedRectangle(D2D1::RoundedRect(r1, barRadius, barRadius), brush);
-            rt->FillRoundedRectangle(D2D1::RoundedRect(r2, barRadius, barRadius), brush);
-            break;
-        }
-        case IconType::Previous: {
-            D2D1_RECT_F bar = D2D1::RectF(
-                ScaleX(6.0f, bounds), ScaleY(6.0f, bounds),
-                ScaleX(8.4f, bounds), ScaleY(18.0f, bounds)
-            );
-            const float barRadius = (bounds.right - bounds.left) * (1.2f / 24.0f);
-            rt->FillRoundedRectangle(D2D1::RoundedRect(bar, barRadius, barRadius), brush);
-            D2D1_POINT_2F pts[] = {
-                Pt(17.6f, 6.8f, bounds),
-                Pt(17.6f, 17.2f, bounds),
-                Pt(9.6f, 12.0f, bounds)
-            };
-            DrawPolygon(rt, factory, brush, pts, 3);
-            break;
-        }
-        case IconType::Next: {
-            D2D1_RECT_F bar = D2D1::RectF(
-                ScaleX(15.6f, bounds), ScaleY(6.0f, bounds),
-                ScaleX(18.0f, bounds), ScaleY(18.0f, bounds)
-            );
-            const float barRadius = (bounds.right - bounds.left) * (1.2f / 24.0f);
-            rt->FillRoundedRectangle(D2D1::RoundedRect(bar, barRadius, barRadius), brush);
-            D2D1_POINT_2F pts[] = {
-                Pt(6.4f, 6.8f, bounds),
-                Pt(6.4f, 17.2f, bounds),
-                Pt(14.4f, 12.0f, bounds)
-            };
-            DrawPolygon(rt, factory, brush, pts, 3);
-            break;
-        }
-        case IconType::Volume: {
-            D2D1_POINT_2F pts[] = {
-                Pt(4.0f, 9.0f, bounds),
-                Pt(8.0f, 9.0f, bounds),
-                Pt(13.0f, 5.0f, bounds),
-                Pt(13.0f, 19.0f, bounds),
-                Pt(8.0f, 15.0f, bounds),
-                Pt(4.0f, 15.0f, bounds)
-            };
-            DrawPolygon(rt, factory, brush, pts, 6);
-            break;
-        }
-        case IconType::CapsLock: {
-            D2D1_POINT_2F pts[] = {
-                Pt(12.0f, 4.0f, bounds),
-                Pt(4.0f, 13.0f, bounds),
-                Pt(9.0f, 13.0f, bounds),
-                Pt(9.0f, 18.0f, bounds),
-                Pt(15.0f, 18.0f, bounds),
-                Pt(15.0f, 13.0f, bounds),
-                Pt(20.0f, 13.0f, bounds)
-            };
-            DrawPolygon(rt, factory, brush, pts, 7);
-            break;
-        }
-        case IconType::Bolt: {
-            D2D1_POINT_2F pts[] = {
-                Pt(13.0f, 2.0f, bounds),
-                Pt(5.0f, 14.0f, bounds),
-                Pt(11.0f, 14.0f, bounds),
-                Pt(10.0f, 22.0f, bounds),
-                Pt(18.0f, 10.0f, bounds),
-                Pt(12.0f, 10.0f, bounds)
-            };
-            DrawPolygon(rt, factory, brush, pts, 6);
-            break;
-        }
-        case IconType::Bluetooth: {
-            D2D1_POINT_2F pts[] = {
-                Pt(7.0f, 7.0f, bounds),
-                Pt(17.0f, 17.0f, bounds),
-                Pt(12.0f, 22.0f, bounds),
-                Pt(12.0f, 2.0f, bounds),
-                Pt(17.0f, 7.0f, bounds),
-                Pt(7.0f, 17.0f, bounds)
-            };
-            float strokeW = (bounds.right - bounds.left) * (1.8f / 24.0f);
-            DrawPolyline(rt, factory, brush, pts, 6, strokeW > 1.0f ? strokeW : 1.0f);
-            break;
-        }
-        case IconType::Battery: {
-            D2D1_RECT_F body = D2D1::RectF(
-                ScaleX(3.0f, bounds), ScaleY(8.0f, bounds),
-                ScaleX(19.0f, bounds), ScaleY(16.0f, bounds)
-            );
-            D2D1_ROUNDED_RECT roundedBody = D2D1::RoundedRect(body, 2.0f, 2.0f);
-            rt->DrawRoundedRectangle(roundedBody, brush, 1.5f);
-            
-            D2D1_RECT_F tip = D2D1::RectF(
-                ScaleX(19.5f, bounds), ScaleY(11.0f, bounds),
-                ScaleX(21.5f, bounds), ScaleY(13.0f, bounds)
-            );
-            D2D1_ROUNDED_RECT roundedTip = D2D1::RoundedRect(tip, 0.8f, 0.8f);
-            rt->FillRoundedRectangle(roundedTip, brush);
-            
-            D2D1_RECT_F fill = D2D1::RectF(
-                ScaleX(4.5f, bounds), ScaleY(9.5f, bounds),
-                ScaleX(11.0f, bounds), ScaleY(14.5f, bounds)
-            );
-            rt->FillRectangle(fill, brush);
-            break;
-        }
-        case IconType::Checkmark: {
-            D2D1_POINT_2F pts[] = {
-                Pt(5.0f, 12.0f, bounds),
-                Pt(10.0f, 17.0f, bounds),
-                Pt(19.0f, 7.0f, bounds),
-                Pt(17.0f, 5.0f, bounds),
-                Pt(10.0f, 13.0f, bounds),
-                Pt(7.0f, 10.0f, bounds)
-            };
-            DrawPolygon(rt, factory, brush, pts, 6);
-            break;
-        }
-    }
+    DrawIconGlyph(rt, factory, brush, kGlyphs[index], bounds);
 }
 } // namespace Graphics
 } // namespace DynamicIsland
@@ -1658,9 +1857,10 @@ bool D2DRenderer::Initialize(HWND hwnd) {
     }
     
     std::wstring fontFamily;
-    // All text formats use the emphasis weight so that every label and digit
-    // renders with the same typography as the compact track title.
-    DWRITE_FONT_WEIGHT weightEmphasis = DWRITE_FONT_WEIGHT_MEDIUM;
+    // Keep regular and emphasized text formats distinct so calls with
+    // bold=true (including the media track title) are actually bold.
+    DWRITE_FONT_WEIGHT weightRegular = DWRITE_FONT_WEIGHT_MEDIUM;
+    DWRITE_FONT_WEIGHT weightBold = DWRITE_FONT_WEIGHT_BOLD;
     float sizeRegular = 12.0f;
     float sizeBig     = 32.0f;
     float sizeSmall   = 11.0f;
@@ -1681,7 +1881,8 @@ bool D2DRenderer::Initialize(HWND hwnd) {
             }
         };
         
-        weightEmphasis = toDwriteWeight(g_settings.fontWeightBold);
+        weightRegular = toDwriteWeight(g_settings.fontWeightRegular);
+        weightBold = toDwriteWeight(g_settings.fontWeightBold);
         sizeRegular = static_cast<float>(g_settings.fontSizeRegular);
         sizeBig     = static_cast<float>(g_settings.fontSizeBig);
         sizeSmall   = static_cast<float>(g_settings.fontSizeSmall);
@@ -1724,7 +1925,7 @@ bool D2DRenderer::Initialize(HWND hwnd) {
     hr = m_dwriteFactory->CreateTextFormat(
         fontFamily.c_str(),
         nullptr,
-        weightEmphasis,
+        weightRegular,
         DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL,
         sizeRegular,
@@ -1736,7 +1937,7 @@ bool D2DRenderer::Initialize(HWND hwnd) {
         m_dwriteFactory->CreateTextFormat(
             fontFamily.c_str(),
             nullptr,
-            weightEmphasis,
+            weightBold,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
             sizeRegular,
@@ -1749,7 +1950,7 @@ bool D2DRenderer::Initialize(HWND hwnd) {
         m_dwriteFactory->CreateTextFormat(
             fontFamily.c_str(),
             nullptr,
-            weightEmphasis,
+            weightRegular,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
             sizeBig,
@@ -1759,7 +1960,7 @@ bool D2DRenderer::Initialize(HWND hwnd) {
         m_dwriteFactory->CreateTextFormat(
             fontFamily.c_str(),
             nullptr,
-            weightEmphasis,
+            weightRegular,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
             sizeSmall,
@@ -1768,21 +1969,17 @@ bool D2DRenderer::Initialize(HWND hwnd) {
         );
     }
     
-    auto configureNoWrapAndEllipsis = [this](IDWriteTextFormat* format) {
-        if (!format || !m_dwriteFactory) return;
+    auto configureNoWrap = [](IDWriteTextFormat* format) {
+        if (!format) return;
+        // No wrapping, no ellipsis: overflowing text is simply clipped at the
+        // pill edge (the iOS island does the same, no trailing "...").
         format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        DWRITE_TRIMMING trimming{};
-        trimming.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER;
-        ComPtr<IDWriteInlineObject> ellipsisSign;
-        if (SUCCEEDED(m_dwriteFactory->CreateEllipsisTrimmingSign(format, ellipsisSign.GetAddressOf()))) {
-            format->SetTrimming(&trimming, ellipsisSign.Get());
-        }
     };
     
-    configureNoWrapAndEllipsis(m_textFormatRegular.Get());
-    configureNoWrapAndEllipsis(m_textFormatBold.Get());
-    configureNoWrapAndEllipsis(m_textFormatSmall.Get());
-    configureNoWrapAndEllipsis(m_textFormatBig.Get());
+    configureNoWrap(m_textFormatRegular.Get());
+    configureNoWrap(m_textFormatBold.Get());
+    configureNoWrap(m_textFormatSmall.Get());
+    configureNoWrap(m_textFormatBig.Get());
     
     m_memDC = CreateCompatibleDC(nullptr);
     if (!m_memDC) {
@@ -2060,11 +2257,18 @@ void D2DRenderer::DrawTextCentered(const std::wstring& text, const D2D1_RECT_F& 
     }
 
     const float centerX = (rect.left + rect.right) * 0.5f;
+    float originX = centerX - cached->textWidth * 0.5f;
+    // When the text is wider than the rect, centering would push the draw
+    // origin (and its clip window) to the left of rect.left, spilling the
+    // glyphs over neighbours like the album art. Left-align overflowing text
+    // instead so it simply clips at the right edge.
+    if (originX < rect.left) originX = rect.left;
     m_solidBrush->SetColor(color);
     m_dcRenderTarget->DrawTextLayout(
-        D2D1::Point2F(centerX - cached->textWidth * 0.5f, rect.top),
+        D2D1::Point2F(originX, rect.top),
         cached->layout.Get(), m_solidBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
+
 
 void D2DRenderer::DrawMarqueeText(const std::wstring& text, const D2D1_RECT_F& rect, D2D1_COLOR_F color, float offset, bool bold) {
     if (!m_dcRenderTarget || !m_solidBrush || !m_dwriteFactory || text.empty()) return;
@@ -2100,6 +2304,8 @@ void D2DRenderer::DrawMarqueeText(const std::wstring& text, const D2D1_RECT_F& r
             newItem.layout.GetAddressOf()
         );
         if (SUCCEEDED(hr) && newItem.layout) {
+            // Guarantee a true bold face for the expanded track title.
+            if (bold) newItem.layout->SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_RANGE{ 0, static_cast<UINT32>(text.length()) });
             DWRITE_TEXT_METRICS tm;
             newItem.layout->GetMetrics(&tm);
             newItem.textWidth = tm.width;
@@ -2115,6 +2321,7 @@ void D2DRenderer::DrawMarqueeText(const std::wstring& text, const D2D1_RECT_F& r
             newItem.loopLayout.GetAddressOf()
         );
         if (SUCCEEDED(hr) && newItem.loopLayout) {
+            if (bold) newItem.loopLayout->SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_RANGE{ 0, static_cast<UINT32>(loopText.length()) });
             DWRITE_TEXT_METRICS loopMetrics;
             newItem.loopLayout->GetMetrics(&loopMetrics);
             newItem.loopUnitWidth = loopMetrics.width;
@@ -2245,47 +2452,32 @@ void D2DRenderer::DrawStatusDot(D2D1_POINT_2F center, float radius, D2D1_COLOR_F
     m_dcRenderTarget->FillEllipse(D2D1::Ellipse(center, radius, radius), m_solidBrush.Get());
 }
 
-void D2DRenderer::DrawEqualizerWaves(D2D1_POINT_2F origin, float height, float lowBand, float midBand, float highBand, bool playing) {
+void D2DRenderer::DrawEqualizerWaves(D2D1_POINT_2F origin, float height, const float* inputBands, bool playing) {
     if (!m_dcRenderTarget || !m_solidBrush) return;
-    
+
     m_solidBrush->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
-    
-    float centerY = origin.y + height / 2.0f;
-    
-    if (!playing) {
-        for (int i = 0; i < 3; ++i) {
-            float cx = origin.x + i * 5.0f + 1.25f;
-            m_dcRenderTarget->FillEllipse(
-                D2D1::Ellipse(D2D1::Point2F(cx, centerY), 1.25f, 1.25f),
-                m_solidBrush.Get());
+    const float centerY = origin.y + height / 2.0f;
+    constexpr int kBarCount = 6;
+    constexpr float kBarWidth = 2.0f;
+    constexpr float kBarPitch = 3.2f;
+    constexpr float kBarRadius = 1.0f;
+
+    if (!playing || !inputBands) {
+        for (int i = 0; i < kBarCount; ++i) {
+            const float cx = origin.x + i * kBarPitch + kBarWidth / 2.0f;
+            m_dcRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, centerY), kBarRadius, kBarRadius), m_solidBrush.Get());
         }
         return;
     }
-    
-    float sum = lowBand + midBand + highBand;
-    float fallbackOffsets[3] = { 0.3f, 0.5f, 0.35f };
-    
-    if (sum < 0.01f) {
-        lowBand  = fallbackOffsets[0];
-        midBand  = fallbackOffsets[1];
-        highBand = fallbackOffsets[2];
-    }
-    
-    float bands[3] = { lowBand, midBand, highBand };
-    
-    for (int i = 0; i < 3; ++i) {
-        float v = bands[i];
-        if (v < 0.03f) v = 0.03f;
-        if (v > 1.0f) v = 1.0f;
-        
-        float barH = height * (0.05f + 0.95f * v);
-        float barW = 2.5f;
-        float barLeft = origin.x + i * 5.0f;
-        
-        D2D1_ROUNDED_RECT r = D2D1::RoundedRect(
-            D2D1::RectF(barLeft, centerY - barH / 2.0f, barLeft + barW, centerY + barH / 2.0f),
-            1.25f, 1.25f
-        );
+
+    for (int i = 0; i < kBarCount; ++i) {
+        float v = Utils::Clamp(inputBands[i], 0.0f, 1.0f);
+        // Keep a small idle baseline, with headroom for loud transients.
+        const float barH = height * (0.10f + 0.74f * v);
+        const float barLeft = origin.x + i * kBarPitch;
+        const D2D1_ROUNDED_RECT r = D2D1::RoundedRect(
+            D2D1::RectF(barLeft, centerY - barH / 2.0f, barLeft + kBarWidth, centerY + barH / 2.0f),
+            kBarRadius, kBarRadius);
         m_dcRenderTarget->FillRoundedRectangle(r, m_solidBrush.Get());
     }
 }
@@ -2454,7 +2646,7 @@ void D2DRenderer::DrawButtonPill(const D2D1_RECT_F& bounds, const std::wstring& 
     }
 }
 
-void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, bool isHovered) {
+void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, bool isHovered, float iconScale) {
     if (!m_dcRenderTarget || !m_solidBrush) return;
     
     float w = bounds.right - bounds.left;
@@ -2468,7 +2660,7 @@ void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, b
         m_dcRenderTarget->FillEllipse(D2D1::Ellipse(center, radius, radius), m_solidBrush.Get());
     }
     
-    float iconSize = 18.0f;
+    float iconSize = 22.0f * iconScale;
     D2D1_RECT_F iconBounds = D2D1::RectF(
         center.x - iconSize / 2.0f,
         center.y - iconSize / 2.0f,
@@ -2518,7 +2710,7 @@ IslandMetrics LayoutEngine::CalculateMetrics(
         int heightForEvent = (eventType == EventType::None) ? idleH : compactH;
         
         switch (eventType) {
-            case EventType::Media:      defaultWidth = 196.0f; break;
+            case EventType::Media:      defaultWidth = 191.0f; break; // Compact media player: 5 px narrower
             case EventType::Timer:      defaultWidth = 176.0f; break;
             case EventType::MicStatus:  defaultWidth = 176.0f; break;
             case EventType::Volume:     defaultWidth = 206.0f; break;
@@ -2563,6 +2755,13 @@ IslandMetrics LayoutEngine::CalculateMetrics(
         m.cornerRadius = Utils::ScaleDpiF(26.0f, dpi);
     }
     
+    // Slightly shorten the island by 5 DPI-scaled pixels while preserving its height.
+    // Position is recalculated below, so the island remains horizontally centered.
+    if (state != IslandState::Hidden) {
+        const float widthReduction = Utils::ScaleDpiF(5.0f, dpi);
+        m.width = (m.width > widthReduction) ? (m.width - widthReduction) : m.width;
+    }
+
     int screenWidth = tbInfo.monitorRect.right - tbInfo.monitorRect.left;
     int centerX = tbInfo.monitorRect.left + screenWidth / 2;
     
@@ -2990,10 +3189,10 @@ bool IslandWindow::TryBeginSeek(float localX, float localY, float w, float h) {
         return false;
     }
     
-    // Generous hit area around the thin progress bar (Y ≈ 82–86 in layout coords).
-    const float barLeft = 16.0f;
-    const float barRight = w - 16.0f;
-    const float barTop = 74.0f;
+    // Generous hit area around the thin progress bar (Y approximately 80-86 in layout coordinates).
+    const float barLeft = 54.0f;
+    const float barRight = w - 54.0f;
+    const float barTop = 70.0f;
     const float barBottom = 96.0f;
     
     if (localX < barLeft || localX > barRight || localY < barTop || localY > barBottom) {
@@ -3007,8 +3206,8 @@ bool IslandWindow::TryBeginSeek(float localX, float localY, float w, float h) {
 }
 
 void IslandWindow::UpdateSeekFromLocalX(float localX, float w) {
-    const float barLeft = 16.0f;
-    const float barRight = w - 16.0f;
+    const float barLeft = 54.0f;
+    const float barRight = w - 54.0f;
     const float barWidth = (std::max)(1.0f, barRight - barLeft);
     float t = (localX - barLeft) / barWidth;
     m_seekProgress = Utils::Clamp(t, 0.0f, 1.0f);
@@ -3038,6 +3237,46 @@ void IslandWindow::EndSeek(bool commit) {
     }
 }
 
+bool IslandWindow::TryBeginVolumeDrag(float localX, float localY, float w, float h) {
+    if (m_state != IslandState::Compact || m_currentEvent != EventType::Volume) {
+        return false;
+    }
+    
+    // Same geometry the compact volume pill draws (with a generous hit area).
+    const float barLeft = 38.0f;
+    const float barRight = w - 42.0f;
+    const float cy = h / 2.0f;
+    
+    if (localX < barLeft - 8.0f || localX > barRight + 8.0f) return false;
+    if (localY < cy - 12.0f || localY > cy + 12.0f) return false;
+    
+    m_isVolumeDragging = true;
+    UpdateVolumeDragFromLocalX(localX, w);
+    return true;
+}
+
+void IslandWindow::UpdateVolumeDragFromLocalX(float localX, float w) {
+    const float barLeft = 38.0f;
+    const float barRight = w - 42.0f;
+    const float barWidth = (std::max)(1.0f, barRight - barLeft);
+    float t = (localX - barLeft) / barWidth;
+    t = Utils::Clamp(t, 0.0f, 1.0f);
+    
+    m_volumeDragFraction = t;
+    if (m_serviceManager) {
+        m_serviceManager->OnVolumeScrub(t);
+    }
+    
+    Render();
+}
+
+void IslandWindow::EndVolumeDrag() {
+    if (!m_isVolumeDragging) return;
+    
+    m_isVolumeDragging = false;
+    m_volumeDragEndTimeMs = Graphics::GetHighPrecisionTimeMs();
+}
+
 void IslandWindow::OnClick(int clientX, int clientY) {
     float localX = static_cast<float>(clientX) - m_currentPillX;
     float localY = static_cast<float>(clientY) - m_currentPillY;
@@ -3062,8 +3301,7 @@ void IslandWindow::OnClick(int clientX, int clientY) {
     }
     
     if (m_state == IslandState::Expanded) {
-        UINT dpi = m_cachedTaskbar.dpi;
-        
+        // Hit regions use the same 96-DPI Direct2D coordinates as the drawn controls.
         if (m_currentEvent == EventType::Media) {
             // Click-to-seek on the progress bar (also works if the user didn't drag).
             if (TryBeginSeek(localX, localY, w, h)) {
@@ -3072,38 +3310,38 @@ void IslandWindow::OnClick(int clientX, int clientY) {
             }
             
             float midX = w / 2.0f;
-            float btnY1 = Utils::ScaleDpiF(98.0f, dpi);
-            float btnY2 = Utils::ScaleDpiF(136.0f, dpi);
+            float btnY1 = 98.0f;
+            float btnY2 = 136.0f;
             
             if (localY >= btnY1 && localY <= btnY2) {
-                float prevX1 = midX - Utils::ScaleDpiF(48.0f, dpi);
-                float prevX2 = midX - Utils::ScaleDpiF(12.0f, dpi);
+                float prevX1 = midX - 60.0f;
+                float prevX2 = midX - 26.0f;
                 if (localX >= prevX1 && localX <= prevX2) {
                     if (m_serviceManager) m_serviceManager->OnMediaPrev();
                     return;
                 }
                 
-                float playX1 = midX - Utils::ScaleDpiF(16.0f, dpi);
-                float playX2 = midX + Utils::ScaleDpiF(16.0f, dpi);
+                float playX1 = midX - 22.0f;
+                float playX2 = midX + 22.0f;
                 if (localX >= playX1 && localX <= playX2) {
                     if (m_serviceManager) m_serviceManager->OnMediaPlayPause();
                     return;
                 }
                 
-                float nextX1 = midX + Utils::ScaleDpiF(12.0f, dpi);
-                float nextX2 = midX + Utils::ScaleDpiF(48.0f, dpi);
+                float nextX1 = midX + 26.0f;
+                float nextX2 = midX + 60.0f;
                 if (localX >= nextX1 && localX <= nextX2) {
                     if (m_serviceManager) m_serviceManager->OnMediaNext();
                     return;
                 }
             }
         } else if (m_currentEvent == EventType::Timer) {
-            float btnW = Utils::ScaleDpiF(90.0f, dpi);
-            float btnGap = Utils::ScaleDpiF(16.0f, dpi);
+            float btnW = 90.0f;
+            float btnGap = 16.0f;
             float b1Left = (w - btnW * 2.0f - btnGap) / 2.0f;
             
-            float btnY1 = Utils::ScaleDpiF(70.0f, dpi);
-            float btnY2 = Utils::ScaleDpiF(108.0f, dpi);
+            float btnY1 = 70.0f;
+            float btnY2 = 108.0f;
             
             if (localY >= btnY1 && localY <= btnY2) {
                 if (localX >= b1Left && localX <= b1Left + btnW) {
@@ -3122,35 +3360,20 @@ void IslandWindow::OnClick(int clientX, int clientY) {
 
 void IslandWindow::UpdateEqualizerSmoothing() {
     Services::EqBands target = m_serviceManager ? m_serviceManager->GetAudioBands() : Services::EqBands{};
-    
-    // When the loopback analyser has no data yet but a track is playing,
-    // synthesize a gentle animated fallback so the waves keep moving.
-    if (m_currentEvent == EventType::Media && m_mediaState.isPlaying &&
-        (target.low + target.mid + target.high) < 0.01f) {
-        const float kPi = 3.14159265358979f;
-        const float t = m_waveProgress * 2.0f * kPi;
-        target.low  = 0.32f + 0.24f * std::sin(t);
-        target.mid  = 0.42f + 0.28f * std::sin(t * 1.7f + 1.3f);
-        target.high = 0.28f + 0.20f * std::sin(t * 2.3f + 2.6f);
-    }
-    
+
     const double now = Graphics::GetHighPrecisionTimeMs();
     double dt = (m_lastEqUpdateTimeMs > 0.0) ? (now - m_lastEqUpdateTimeMs) / 1000.0 : 0.033;
     m_lastEqUpdateTimeMs = now;
-    if (dt < 0.0) dt = 0.0;
-    if (dt > 0.1) dt = 0.1;
+    dt = (std::max)(0.0, (std::min)(dt, 0.1));
     const float dtF = static_cast<float>(dt);
-    
-    // Exponential smoothing with a fast attack and a slower release: the bars
-    // respond quickly to beats but glide smoothly between audio polls.
-    auto ease = [dtF](float& cur, float goal, float attackRate, float decayRate) {
-        const float rate = (goal > cur) ? attackRate : decayRate;
+
+    // Independent envelopes per frequency band: quick attack, gentle release.
+    for (int i = 0; i < 6; ++i) {
+        const float goal = Utils::Clamp(target.values[i], 0.0f, 1.0f);
+        const float rate = (goal > m_eqBandSmooth[i]) ? 8.0f : 2.8f;
         const float alpha = 1.0f - std::exp(-rate * dtF);
-        cur += (goal - cur) * alpha;
-    };
-    ease(m_eqLowSmooth,  Utils::Clamp(target.low, 0.0f, 1.0f),  18.0f, 4.5f);
-    ease(m_eqMidSmooth,  Utils::Clamp(target.mid, 0.0f, 1.0f),  18.0f, 4.5f);
-    ease(m_eqHighSmooth, Utils::Clamp(target.high, 0.0f, 1.0f), 18.0f, 4.5f);
+        m_eqBandSmooth[i] += (goal - m_eqBandSmooth[i]) * alpha;
+    }
 }
 
 void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, float alpha) {
@@ -3169,22 +3392,29 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             bool eqActive = !medState.title.empty();
             // Per-frame smoothed bands (updated in UpdateEqualizerSmoothing)
             // keep the compact bars moving fluidly instead of stepping.
-            Services::EqBands bands{ m_eqLowSmooth, m_eqMidSmooth, m_eqHighSmooth };
             m_renderer->DrawEqualizerWaves(
-                D2D1::Point2F(w - 22.0f, (h - 12.0f) / 2.0f),
+                D2D1::Point2F(w - 28.0f, (h - 12.0f) / 2.0f),
                 12.0f,
-                bands.low, bands.mid, bands.high,
+                m_eqBandSmooth,
                 eqActive
             );
             
             std::wstring track = medState.title;
-            m_renderer->DrawTextCentered(
-                track,
-                D2D1::RectF(44.0f, (h - 16.0f) / 2.0f, w - 32.0f, (h + 16.0f) / 2.0f),
-                D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
-                12.0f,
-                true
-            );
+            // The compact pill is too small for long titles: if the title is
+            // longer than 6 characters, don't render any text at all (art and
+            // equalizer only). Short titles (<= 6 chars) show as before.
+            if (track.size() > 6) {
+                track.clear();
+            }
+            if (!track.empty()) {
+                m_renderer->DrawTextCentered(
+                    track,
+                    D2D1::RectF(44.0f, (h - 16.0f) / 2.0f, w - 32.0f, (h + 16.0f) / 2.0f),
+                    D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
+                    12.0f,
+                    true
+                );
+            }
             break;
         }
         case EventType::Timer: {
@@ -3230,12 +3460,22 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::Volume: {
-            D2D1_RECT_F volRect = D2D1::RectF(12.0f, (h - 18.0f) / 2.0f, 30.0f, (h + 18.0f) / 2.0f);
+            D2D1_RECT_F volRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
             m_renderer->DrawIconImage(Graphics::IconType::Volume, volRect, D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha));
             
-            float barLeft = 34.0f;
+            float barLeft = 38.0f;
             float barRight = w - 42.0f;
             float frac = trState.progressFraction > 0.0f ? trState.progressFraction : 0.68f;
+            int val = trState.value > 0 ? trState.value : 68;
+            
+            // While (or just after) scrubbing, show the local drag value instead
+            // of the last polled value so the bar tracks the cursor exactly.
+            const double dragNow = Graphics::GetHighPrecisionTimeMs();
+            if (m_isVolumeDragging ||
+                (m_volumeDragEndTimeMs > 0.0 && dragNow - m_volumeDragEndTimeMs < 400.0)) {
+                frac = m_volumeDragFraction;
+                val = static_cast<int>(std::lround(frac * 100.0f));
+            }
             
             m_renderer->DrawProgressBar(
                 D2D1::RectF(barLeft, (h - 4.0f) / 2.0f, barRight, (h + 4.0f) / 2.0f),
@@ -3244,7 +3484,6 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
                 D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha)
             );
             
-            int val = trState.value > 0 ? trState.value : 68;
             m_renderer->DrawTextString(
                 std::to_wstring(val) + L"%",
                 D2D1::RectF(w - 36.0f, (h - 16.0f) / 2.0f, w - 8.0f, (h + 16.0f) / 2.0f),
@@ -3255,7 +3494,7 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::CapsLock: {
-            D2D1_RECT_F capsRect = D2D1::RectF(12.0f, (h - 18.0f) / 2.0f, 30.0f, (h + 18.0f) / 2.0f);
+            D2D1_RECT_F capsRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
             m_renderer->DrawIconImage(Graphics::IconType::CapsLock, capsRect, D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha));
             
             std::wstring capsLabel = trState.title.empty()
@@ -3263,7 +3502,7 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
                 : trState.title;
             m_renderer->DrawTextString(
                 capsLabel,
-                D2D1::RectF(34.0f, (h - 16.0f) / 2.0f, w - 45.0f, (h + 16.0f) / 2.0f),
+                D2D1::RectF(38.0f, (h - 16.0f) / 2.0f, w - 45.0f, (h + 16.0f) / 2.0f),
                 D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
                 12.0f,
                 false
@@ -3280,21 +3519,15 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::Power: {
-            D2D1_RECT_F boltRect = D2D1::RectF(12.0f, (h - 18.0f) / 2.0f, 30.0f, (h + 18.0f) / 2.0f);
-            m_renderer->DrawIconImage(Graphics::IconType::Bolt, boltRect, D2D1::ColorF(0.188f, 0.820f, 0.345f, alpha));
-            
-            m_renderer->DrawTextString(
-                L"Charging",
-                D2D1::RectF(34.0f, (h - 16.0f) / 2.0f, w - 50.0f, (h + 16.0f) / 2.0f),
-                D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
-                12.0f,
-                false
-            );
+            // iOS-style charging pill: green battery + percentage, no text.
+            D2D1_RECT_F batRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
+            m_renderer->DrawIconImage(Graphics::IconType::BatteryHorizontal, batRect,
+                                      D2D1::ColorF(0.188f, 0.820f, 0.345f, alpha));
             
             int pVal = trState.value > 0 ? trState.value : 62;
             m_renderer->DrawTextString(
                 std::to_wstring(pVal) + L"%",
-                D2D1::RectF(w - 46.0f, (h - 16.0f) / 2.0f, w - 10.0f, (h + 16.0f) / 2.0f),
+                D2D1::RectF(38.0f, (h - 16.0f) / 2.0f, w - 14.0f, (h + 16.0f) / 2.0f),
                 D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
                 12.0f,
                 true
@@ -3302,13 +3535,13 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::Bluetooth: {
-            D2D1_RECT_F btRect = D2D1::RectF(12.0f, (h - 18.0f) / 2.0f, 30.0f, (h + 18.0f) / 2.0f);
+            D2D1_RECT_F btRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
             m_renderer->DrawIconImage(Graphics::IconType::Bluetooth, btRect, D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha));
             
             std::wstring dev = trState.title.empty() ? L"WH-1000XM5" : trState.title;
             m_renderer->DrawTextString(
                 dev,
-                D2D1::RectF(34.0f, (h - 16.0f) / 2.0f, w - 50.0f, (h + 16.0f) / 2.0f),
+                D2D1::RectF(38.0f, (h - 16.0f) / 2.0f, w - 50.0f, (h + 16.0f) / 2.0f),
                 D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
                 12.0f,
                 false
@@ -3327,12 +3560,12 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::LowBattery: {
-            D2D1_RECT_F batRect = D2D1::RectF(12.0f, (h - 18.0f) / 2.0f, 30.0f, (h + 18.0f) / 2.0f);
-            m_renderer->DrawIconImage(Graphics::IconType::Battery, batRect, D2D1::ColorF(1.0f, 0.271f, 0.227f, alpha));
+            D2D1_RECT_F batRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
+            m_renderer->DrawIconImage(Graphics::IconType::BatteryHorizontal, batRect, D2D1::ColorF(1.0f, 0.271f, 0.227f, alpha));
             
             m_renderer->DrawTextString(
                 L"Low battery",
-                D2D1::RectF(34.0f, (h - 16.0f) / 2.0f, w - 50.0f, (h + 16.0f) / 2.0f),
+                D2D1::RectF(38.0f, (h - 16.0f) / 2.0f, w - 50.0f, (h + 16.0f) / 2.0f),
                 D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
                 12.0f,
                 false
@@ -3349,12 +3582,12 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::TimerDone: {
-            D2D1_RECT_F okRect = D2D1::RectF(12.0f, (h - 18.0f) / 2.0f, 30.0f, (h + 18.0f) / 2.0f);
+            D2D1_RECT_F okRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
             m_renderer->DrawIconImage(Graphics::IconType::Checkmark, okRect, D2D1::ColorF(0.188f, 0.820f, 0.345f, alpha));
             
             m_renderer->DrawTextString(
                 L"Timer done",
-                D2D1::RectF(34.0f, (h - 16.0f) / 2.0f, w - 10.0f, (h + 16.0f) / 2.0f),
+                D2D1::RectF(38.0f, (h - 16.0f) / 2.0f, w - 10.0f, (h + 16.0f) / 2.0f),
                 D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
                 12.0f,
                 false
@@ -3406,11 +3639,9 @@ void IslandWindow::Render() {
         
         D2D1_ROUNDED_RECT pill = D2D1::RoundedRect(D2D1::RectF(0.0f, 0.0f, w, h), r, r);
         
-        D2D1_COLOR_F bgColor     = D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f * o);
-        D2D1_COLOR_F borderColor = D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.14f * o);
-        float borderWidth = Utils::ScaleDpiF(1.0f, m_cachedTaskbar.dpi);
-        
-        m_renderer->DrawRoundedPill(pill, bgColor, borderColor, borderWidth);
+        D2D1_COLOR_F bgColor = D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f * o);
+        // No border stroke: the island reads as one solid iOS-style pill.
+        m_renderer->DrawRoundedPill(pill, bgColor, D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f), 0.0f);
         
         IslandState visualState = m_state;
         float compactThreshold = Utils::ScaleDpiF(50.0f, m_cachedTaskbar.dpi);
@@ -3462,7 +3693,7 @@ void IslandWindow::Render() {
                         D2D1::RectF(80.0f, 44.0f, w - 16.0f, 64.0f),
                         D2D1::ColorF(0.66f, 0.67f, 0.71f, 1.0f),
                         m_mediaState.isPlaying ? m_marqueeOffset * 0.7f : 0.0f,
-                        true
+                        false
                     );
                     
                     // Extrapolate playback position from the Windows monotonic clock.
@@ -3490,50 +3721,66 @@ void IslandWindow::Render() {
                         displayProgress = (std::max)(0.0f, (std::min)(displayProgress, 1.0f));
                     }
 
-                    // Slightly taller bar when seeking for clearer feedback.
-                    const float barY1 = m_isSeeking ? 80.0f : 82.0f;
+                    // iOS-style row: elapsed time, bar, negative remaining time.
+                    // Slightly taller bar while seeking for clearer feedback.
+                    const float barY1 = m_isSeeking ? 78.0f : 80.0f;
                     const float barY2 = m_isSeeking ? 88.0f : 86.0f;
                     m_renderer->DrawProgressBar(
-                        D2D1::RectF(16.0f, barY1, w - 16.0f, barY2),
+                        D2D1::RectF(56.0f, barY1, w - 56.0f, barY2),
                         displayProgress,
                         D2D1::ColorF(1.0f, 1.0f, 1.0f, m_isSeeking ? 0.28f : 0.18f),
                         D2D1::ColorF(D2D1::ColorF::White)
                     );
 
-                    // Elapsed time on the left, full track duration on the right.
                     const std::wstring elapsedText = Utils::FormatDuration(displayElapsedSeconds);
-                    const std::wstring durationText = Utils::FormatDuration(m_mediaState.durationSeconds);
+                    std::wstring rightText = Utils::FormatDuration(m_mediaState.durationSeconds);
+                    if (m_mediaState.durationSeconds > 0) {
+                        // "-m:ss" like the iOS island (time left, not total).
+                        rightText = L"-" + Utils::FormatDuration(
+                            (std::max)(0, m_mediaState.durationSeconds - displayElapsedSeconds));
+                    }
                     const D2D1_COLOR_F timeColor = D2D1::ColorF(0.68f, 0.69f, 0.72f, 0.95f);
+                    // Long durations (h:mm:ss, "-h:mm:ss") shrink a step so the
+                    // labels never get clipped at the pill edges.
+                    const float leftFontSize = elapsedText.size() >= 7 ? 7.5f : 9.0f;
+                    const float rightFontSize = rightText.size() >= 7 ? 7.5f : 9.0f;
+                    // Labels are drawn top-aligned, so the rect top is chosen
+                    // such that the digits' optical center sits on the bar's
+                    // center line (bar 80..86, center y = 83): top + 6.5.
                     m_renderer->DrawTextCentered(
                         elapsedText,
-                        D2D1::RectF(16.0f, 87.0f, 66.0f, 100.0f),
+                        D2D1::RectF(10.0f, 76.5f, 52.0f, 98.5f),
                         timeColor,
-                        9.0f,
+                        leftFontSize,
                         false
                     );
                     m_renderer->DrawTextCentered(
-                        durationText,
-                        D2D1::RectF(w - 66.0f, 87.0f, w - 16.0f, 100.0f),
+                        rightText,
+                        D2D1::RectF(w - 52.0f, 76.5f, w - 10.0f, 98.5f),
                         timeColor,
-                        9.0f,
+                        rightFontSize,
                         false
                     );
                     
+                    // Playback controls: wider spread, the center button larger.
                     float midX = w / 2.0f;
                     m_renderer->DrawCircularButton(
-                        D2D1::RectF(midX - 45.0f, 102.0f, midX - 15.0f, 132.0f),
+                        D2D1::RectF(midX - 58.0f, 100.0f, midX - 30.0f, 132.0f),
                         Graphics::IconType::Previous,
-                        false
+                        false,
+                        1.12f
                     );
                     m_renderer->DrawCircularButton(
-                        D2D1::RectF(midX - 15.0f, 102.0f, midX + 15.0f, 132.0f),
+                        D2D1::RectF(midX - 16.0f, 98.0f, midX + 16.0f, 134.0f),
                         m_mediaState.isPlaying ? Graphics::IconType::Pause : Graphics::IconType::Play,
-                        false
+                        false,
+                        1.18f
                     );
                     m_renderer->DrawCircularButton(
-                        D2D1::RectF(midX + 15.0f, 102.0f, midX + 45.0f, 132.0f),
+                        D2D1::RectF(midX + 30.0f, 100.0f, midX + 58.0f, 132.0f),
                         Graphics::IconType::Next,
-                        false
+                        false,
+                        1.12f
                     );
                     break;
                 }
@@ -3690,8 +3937,6 @@ LRESULT CALLBACK IslandWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     if (dt > 0.1) dt = 0.1;
                     
                     self->m_marqueeOffset += static_cast<float>(dt * 16.0);
-                    self->m_waveProgress += static_cast<float>(dt * 2.0);
-                    if (self->m_waveProgress > 1.0f) self->m_waveProgress -= 1.0f;
                     
                     if (self->m_currentEvent == EventType::Media &&
                         self->m_mediaState.isPlaying &&
@@ -3727,6 +3972,12 @@ LRESULT CALLBACK IslandWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 const float w = self->m_animWidth.GetValue();
                 self->UpdateSeekFromLocalX(localX, w);
             }
+            
+            if (self->m_isVolumeDragging) {
+                const float localX = static_cast<float>(GET_X_LPARAM(lParam)) - self->m_currentPillX;
+                const float w = self->m_animWidth.GetValue();
+                self->UpdateVolumeDragFromLocalX(localX, w);
+            }
             return 0;
         }
         
@@ -3749,6 +4000,10 @@ LRESULT CALLBACK IslandWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             const float localY = static_cast<float>(self->m_mouseDownY) - self->m_currentPillY;
             const float w = self->m_animWidth.GetValue();
             const float h = self->m_animHeight.GetValue();
+            
+            if (self->TryBeginVolumeDrag(localX, localY, w, h)) {
+                return 0;
+            }
             self->TryBeginSeek(localX, localY, w, h);
             return 0;
         }
@@ -3761,7 +4016,9 @@ LRESULT CALLBACK IslandWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 int upX = GET_X_LPARAM(lParam);
                 int upY = GET_Y_LPARAM(lParam);
                 
-                if (self->m_isSeeking) {
+                if (self->m_isVolumeDragging) {
+                    self->EndVolumeDrag();
+                } else if (self->m_isSeeking) {
                     self->EndSeek(true);
                 } else if (std::abs(upX - self->m_mouseDownX) < 10 && std::abs(upY - self->m_mouseDownY) < 10) {
                     self->OnClick(upX, upY);
@@ -3773,6 +4030,9 @@ LRESULT CALLBACK IslandWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case WM_CAPTURECHANGED:
             if (self->m_isSeeking) {
                 self->EndSeek(true);
+            }
+            if (self->m_isVolumeDragging) {
+                self->EndVolumeDrag();
             }
             self->m_isMouseDown = false;
             return 0;
@@ -3826,9 +4086,7 @@ void ServiceManager::Shutdown() {
 EqBands ServiceManager::GetAudioBands() const {
     EqBands b{};
     if (m_audioService) {
-        b.low  = m_audioService->GetLowBand();
-        b.mid  = m_audioService->GetMidBand();
-        b.high = m_audioService->GetHighBand();
+        for (size_t i = 0; i < 6; ++i) b.values[i] = m_audioService->GetBand(i);
     }
     return b;
 }
@@ -3881,6 +4139,22 @@ void ServiceManager::SetLiveActivity(EventType type, bool active) {
         case EventType::MicStatus: if (m_micActive != active)   { m_micActive = active;   stateChanged = true; } break;
         default: break;
     }
+
+    // Media state is polled frequently. Avoid reapplying an already-correct
+    // window state on every poll, but repair it if the window became out of sync.
+    if (!stateChanged) {
+        if (!m_window || m_hasActiveTransient) return;
+
+        const EventType current = ResolveCurrentLiveActivity();
+        const bool alwaysVisible =
+            GetSettingsSnapshot().idleVisibilityMode == IdleVisibilityMode::AlwaysVisible;
+        const IslandState windowState = m_window->GetState();
+        const bool visibilityMatches = (current != EventType::None || alwaysVisible)
+            ? windowState != IslandState::Hidden
+            : (windowState == IslandState::Hidden || windowState == IslandState::Expanded);
+
+        if (m_window->GetCurrentEvent() == current && visibilityMatches) return;
+    }
     
     if (!m_hasActiveTransient && m_window) {
         EventType current = ResolveCurrentLiveActivity();
@@ -3903,7 +4177,6 @@ void ServiceManager::SetLiveActivity(EventType type, bool active) {
         }
     }
     
-    (void)stateChanged;
 }
 
 void ServiceManager::PumpNextEvent() {
@@ -3966,11 +4239,25 @@ void ServiceManager::Update() {
             PumpNextEvent();
         }
     }
+
+    if (m_mediaPausedSinceTick != 0 && !m_mediaPauseExpired &&
+        GetTickCount64() - m_mediaPausedSinceTick >= 5000) {
+        m_mediaPauseExpired = true;
+        SetLiveActivity(EventType::Media, false);
+    }
 }
 
 void ServiceManager::UpdateMediaState(const MediaState& state) {
     bool trackChanged = (m_lastTrackTitle != state.title);
     m_lastTrackTitle = state.title;
+
+    if (state.isPlaying || state.title.empty()) {
+        m_mediaPausedSinceTick = 0;
+        m_mediaPauseExpired = false;
+    } else if (trackChanged || (m_mediaPausedSinceTick == 0 && !m_mediaPauseExpired)) {
+        m_mediaPausedSinceTick = GetTickCount64();
+        m_mediaPauseExpired = false;
+    }
     
     if (m_window) {
         m_window->UpdateMediaState(state);
@@ -3994,7 +4281,10 @@ void ServiceManager::UpdateMediaState(const MediaState& state) {
             PostTransientEvent(qe);
         }
     } else {
-        SetLiveActivity(EventType::Media, state.isPlaying);
+        // Keep a paused track visible for five seconds, then let the island
+        // return to its normal idle state until playback resumes or the track changes.
+        const bool pausedExpired = !state.isPlaying && !state.title.empty() && m_mediaPauseExpired;
+        SetLiveActivity(EventType::Media, state.isPlaying || (!state.title.empty() && !pausedExpired));
     }
 }
 
@@ -4071,6 +4361,11 @@ void ServiceManager::OnMediaSeek(float progressFraction) {
             UpdateMediaState(state);
         }
     }
+}
+
+void ServiceManager::OnVolumeScrub(float volumeFraction) {
+    volumeFraction = Utils::Clamp(volumeFraction, 0.0f, 1.0f);
+    if (m_audioService) m_audioService->SetVolume(volumeFraction);
 }
 
 void ServiceManager::OnTimerTogglePause() {
@@ -4196,9 +4491,6 @@ void ServiceManager::TriggerTestScenario(int index) {
     }
 }
 
-void ServiceManager::CycleDemoScenario() {
-    TriggerTestScenario(9);
-}
 
 void ServiceManager::RefreshVisibility() {
     if (!m_hasActiveTransient && m_window) {
@@ -4324,6 +4616,46 @@ bool DecodeBytesToPBGRA(
         h = scaledH;
     }
 
+    // Small sources (e.g. 64x64 GSMTC thumbnails) look heavily pixelated when
+    // the pill stretches them to ~44-52px with a plain linear brush. Upscale
+    // them once to a comfortable resolution with the high-quality Fant filter,
+    // so the brush only ever downscales at render time.
+    constexpr UINT kMinThumbnailSide = 192;
+    if (w < kMinThumbnailSide || h < kMinThumbnailSide) {
+        const double scale = (std::max)(
+            static_cast<double>(kMinThumbnailSide) / static_cast<double>(w),
+            static_cast<double>(kMinThumbnailSide) / static_cast<double>(h));
+        const UINT scaledW = (std::max)(1u, static_cast<UINT>(w * scale + 0.5));
+        const UINT scaledH = (std::max)(1u, static_cast<UINT>(h * scale + 0.5));
+        // Never let the upscale push the buffer past the size limit below,
+        // otherwise unusually shaped art would get rejected entirely.
+        const bool fitsLimit = static_cast<size_t>(scaledW) * static_cast<size_t>(scaledH) * 4u
+            <= 512u * 512u * 4u;
+        if (fitsLimit) {
+        ComPtr<IWICBitmapScaler> upscaler;
+        hr = factory->CreateBitmapScaler(&upscaler);
+        if (SUCCEEDED(hr) && upscaler) {
+            hr = upscaler->Initialize(converter.Get(), scaledW, scaledH, WICBitmapInterpolationModeFant);
+            if (SUCCEEDED(hr)) {
+                ComPtr<IWICFormatConverter> scaledConverter;
+                hr = factory->CreateFormatConverter(&scaledConverter);
+                if (SUCCEEDED(hr) && scaledConverter) {
+                    hr = scaledConverter->Initialize(
+                        upscaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                        WICBitmapDitherTypeNone, nullptr, 0.0f, WICBitmapPaletteTypeCustom);
+                    if (SUCCEEDED(hr)) {
+                        converter = scaledConverter;
+                        w = scaledW;
+                        h = scaledH;
+                    }
+                }
+            }
+        }
+        }
+        // If the upscale failed for any reason, keep using the original
+        // bitmap rather than rejecting the artwork outright.
+    }
+
     const size_t bufferSize64 = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
     if (bufferSize64 == 0 || bufferSize64 > 512u * 512u * 4u) return false;
     const UINT stride = w * 4u;
@@ -4357,8 +4689,10 @@ DWORD WINAPI ThumbnailWorkerThreadProc(LPVOID param) {
     if (FAILED(comInitHr)) {
         MediaService* self = ctx->self;
         self->FinishThumbnailFetch();
-        self->ThumbnailWorkerFinished();
+        self->RequestiTunesArtworkFallback(ctx->trackId);
         delete ctx;
+        // Decrement only after the fallback has had a chance to register itself.
+        self->ThumbnailWorkerFinished();
         return 0;
     }
 
@@ -4366,31 +4700,43 @@ DWORD WINAPI ThumbnailWorkerThreadProc(LPVOID param) {
 
     try {
         if (ctx->thumbRef) {
-            auto stream = ctx->thumbRef.OpenReadAsync().get();
-            if (stream) {
-                uint32_t sz = static_cast<uint32_t>(stream.Size());
-                if (sz > 0 && sz < 20 * 1024 * 1024) {
-                    winrt::Windows::Storage::Streams::DataReader reader(stream);
-                    reader.LoadAsync(sz).get();
-                    
-                    std::vector<uint8_t> streamBytes(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(winrt::array_view<uint8_t>(streamBytes));
-                    
-                    uint32_t width = 0, height = 0;
-                    std::vector<uint8_t> pbgraPixels;
-                    
-                    if (DecodeBytesToPBGRA(streamBytes.data(), streamBytes.size(), width, height, pbgraPixels)) {
-                        ctx->self->StoreDecodedThumbnail(std::move(pbgraPixels), width, height, ctx->trackId);
-                        storedThumbnail = true;
+            using winrt::Windows::Foundation::AsyncStatus;
+            auto openOperation = ctx->thumbRef.OpenReadAsync();
+            if (openOperation.wait_for(std::chrono::seconds(5)) == AsyncStatus::Completed) {
+                auto stream = openOperation.GetResults();
+                if (stream) {
+                    uint32_t sz = static_cast<uint32_t>(stream.Size());
+                    if (sz > 0 && sz < 20 * 1024 * 1024) {
+                        winrt::Windows::Storage::Streams::DataReader reader(stream);
+                        auto loadOperation = reader.LoadAsync(sz);
+                        if (loadOperation.wait_for(std::chrono::seconds(5)) == AsyncStatus::Completed) {
+                            loadOperation.GetResults();
+
+                            std::vector<uint8_t> streamBytes(reader.UnconsumedBufferLength());
+                            reader.ReadBytes(winrt::array_view<uint8_t>(streamBytes));
+
+                            uint32_t width = 0, height = 0;
+                            std::vector<uint8_t> pbgraPixels;
+
+                            if (DecodeBytesToPBGRA(streamBytes.data(), streamBytes.size(), width, height, pbgraPixels)) {
+                                ctx->self->StoreDecodedThumbnail(std::move(pbgraPixels), width, height, ctx->trackId);
+                                storedThumbnail = true;
+                            }
+                        } else {
+                            // Do not let a stalled GSMTC stream hold Stop() open.
+                            loadOperation.Cancel();
+                        }
                     }
                 }
+            } else {
+                // Abandon a stream-open operation that did not finish in time.
+                openOperation.Cancel();
             }
         }
     } catch (...) {}
     
     MediaService* self = ctx->self;
     self->FinishThumbnailFetch();
-    self->ThumbnailWorkerFinished();
     
     if (!storedThumbnail) {
         // GSMTC provided no usable artwork — try the iTunes Search API.
@@ -4400,6 +4746,8 @@ DWORD WINAPI ThumbnailWorkerThreadProc(LPVOID param) {
     delete ctx;
 
     if (SUCCEEDED(comInitHr)) CoUninitialize();
+    // Keep this worker counted until any replacement/fallback worker is registered.
+    self->ThumbnailWorkerFinished();
     return 0;
 }
 
@@ -4469,65 +4817,99 @@ std::wstring ExtractFirstJsonStringValue(const std::string& json, const char* ke
     }
     return WideFromUtf8(value);
 }
-
 bool HttpGetBinary(const std::wstring& url, std::vector<uint8_t>& out, size_t maxBytes) {
+    out.clear();
+    if (url.empty() || maxBytes == 0) return false;
+
     URL_COMPONENTS uc{};
     wchar_t hostName[256] = {};
     wchar_t urlPath[2048] = {};
+    wchar_t extraInfo[2048] = {};
     uc.dwStructSize = sizeof(uc);
     uc.lpszHostName = hostName;
     uc.dwHostNameLength = _countof(hostName) - 1;
     uc.lpszUrlPath = urlPath;
     uc.dwUrlPathLength = _countof(urlPath) - 1;
+    uc.lpszExtraInfo = extraInfo;
+    uc.dwExtraInfoLength = _countof(extraInfo) - 1;
+
     if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &uc)) {
         return false;
     }
-    
-    bool ok = false;
+    if ((uc.nScheme != INTERNET_SCHEME_HTTP && uc.nScheme != INTERNET_SCHEME_HTTPS) ||
+        uc.dwHostNameLength == 0) {
+        return false;
+    }
+
+    std::wstring requestPath(urlPath, uc.dwUrlPathLength);
+    if (requestPath.empty()) requestPath = L"/";
+    if (uc.dwExtraInfoLength > 0) {
+        requestPath.append(extraInfo, uc.dwExtraInfoLength);
+    }
+
     HINTERNET hSession = WinHttpOpen(
         L"DynamicIsland-Windhawk-Mod",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
         0);
-    if (hSession) {
-        HINTERNET hConnect = WinHttpConnect(hSession, hostName, uc.nPort, 0);
-        if (hConnect) {
-            const DWORD secureFlag = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-            HINTERNET hRequest = WinHttpOpenRequest(
-                hConnect, L"GET", urlPath, nullptr,
-                WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secureFlag);
-            if (hRequest) {
-                if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                       WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-                    WinHttpReceiveResponse(hRequest, nullptr)) {
-                    DWORD statusCode = 0;
-                    DWORD statusSize = sizeof(statusCode);
-                    if (WinHttpQueryHeaders(hRequest,
-                                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                            WINHTTP_HEADER_NAME_BY_INDEX,
-                                            &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX) &&
-                        statusCode == 200) {
-                        ok = true;
-                        for (;;) {
-                            DWORD available = 0;
-                            if (!WinHttpQueryDataAvailable(hRequest, &available)) { ok = false; break; }
-                            if (available == 0) break;
-                            if (out.size() + available > maxBytes) { ok = false; break; }
-                            std::vector<uint8_t> chunk(available);
-                            DWORD readBytes = 0;
-                            if (!WinHttpReadData(hRequest, chunk.data(), available, &readBytes)) { ok = false; break; }
-                            if (readBytes == 0) break;
-                            out.insert(out.end(), chunk.begin(), chunk.begin() + readBytes);
-                        }
-                    }
-                }
-                WinHttpCloseHandle(hRequest);
-            }
-            WinHttpCloseHandle(hConnect);
-        }
+    if (!hSession) return false;
+
+    // Bound DNS, connection, send and receive waits so Stop() cannot be held
+    // indefinitely by a stalled artwork request.
+    if (!WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000)) {
         WinHttpCloseHandle(hSession);
+        return false;
     }
+
+    bool ok = false;
+    HINTERNET hConnect = WinHttpConnect(hSession, hostName, uc.nPort, 0);
+    if (hConnect) {
+        const DWORD secureFlag = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = WinHttpOpenRequest(
+            hConnect, L"GET", requestPath.c_str(), nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secureFlag);
+        if (hRequest) {
+            if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(hRequest, nullptr)) {
+                DWORD statusCode = 0;
+                DWORD statusSize = sizeof(statusCode);
+                if (WinHttpQueryHeaders(hRequest,
+                                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                        WINHTTP_HEADER_NAME_BY_INDEX,
+                                        &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX) &&
+                    statusCode == 200) {
+                    ok = true;
+                    for (;;) {
+                        DWORD available = 0;
+                        if (!WinHttpQueryDataAvailable(hRequest, &available)) {
+                            ok = false;
+                            break;
+                        }
+                        if (available == 0) break;
+                        if (available > maxBytes || out.size() > maxBytes - available) {
+                            ok = false;
+                            break;
+                        }
+                        std::vector<uint8_t> chunk(available);
+                        DWORD readBytes = 0;
+                        if (!WinHttpReadData(hRequest, chunk.data(), available, &readBytes)) {
+                            ok = false;
+                            break;
+                        }
+                        if (readBytes == 0) break;
+                        out.insert(out.end(), chunk.begin(), chunk.begin() + readBytes);
+                    }
+                    if (out.empty()) ok = false;
+                }
+            }
+            WinHttpCloseHandle(hRequest);
+        }
+        WinHttpCloseHandle(hConnect);
+    }
+    WinHttpCloseHandle(hSession);
+    if (!ok) out.clear();
     return ok;
 }
 } // namespace
@@ -5226,13 +5608,9 @@ void AudioService::ResetLoopback() {
         m_pwfx = nullptr;
     }
     m_isLoopbackActive = false;
-    m_lpState = 0.0f;
-    m_midLpState = 0.0f;
-    m_lowBandSmooth = 0.0f;
-    m_midBandSmooth = 0.0f;
-    m_highBandSmooth = 0.0f;
-    m_currentRms = 0.0f;
-    m_smoothedRms = 0.0f;
+    for (auto& filter : m_eqFilters) filter = BiquadBand{};
+    m_eqFilterSampleRate = 0.0f;
+    for (float& value : m_bandSmooth) value = 0.0f;
 }
 
 void AudioService::Stop() {
@@ -5337,6 +5715,45 @@ void AudioService::PollVolume() {
     m_hasReportedVolume = true;
 }
 
+void AudioService::SetVolume(float volume) {
+    if (!m_isRunning) return;
+    volume = (std::max)(0.0f, (std::min)(volume, 1.0f));
+    
+    // Activate the endpoint on demand (same path PollVolume uses) so scrubbing
+    // works even before the first poll or after a device switch reset.
+    if (!m_endpointVolume) {
+        if (!m_volumeDeviceEnumerator) {
+            HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                          IID_PPV_ARGS(&m_volumeDeviceEnumerator));
+            if (FAILED(hr) || !m_volumeDeviceEnumerator) return;
+        }
+        ComPtr<IMMDevice> device;
+        HRESULT hr = m_volumeDeviceEnumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+        if (FAILED(hr) || !device) return;
+        hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                              reinterpret_cast<void**>(m_endpointVolume.GetAddressOf()));
+        if (FAILED(hr) || !m_endpointVolume) {
+            m_volumeDeviceEnumerator.Reset();
+            m_volumeDeviceId.clear();
+            return;
+        }
+    }
+    
+    m_endpointVolume->SetMasterVolumeLevelScalar(volume, nullptr);
+    
+    // Scrubbing the slider also unmutes, matching the Windows volume flyout.
+    BOOL muted = FALSE;
+    if (SUCCEEDED(m_endpointVolume->GetMute(&muted)) && muted != FALSE) {
+        m_endpointVolume->SetMute(FALSE, nullptr);
+        m_isMuted = false;
+    }
+    
+    m_currentVolume = volume;
+    // m_lastReportedVolume is intentionally NOT updated here: the next
+    // PollVolume sees the change and re-posts the Volume transient event,
+    // which keeps the pill alive for the whole drag session.
+}
+
 void AudioService::UpdateLoopback() {
     if (!m_isRunning) return;
     
@@ -5368,10 +5785,7 @@ void AudioService::UpdateLoopback() {
     
     if (m_isLoopbackActive && m_captureClient) {
         UINT32 packetLength = 0;
-        float maxLow = 0.0f, maxMid = 0.0f, maxHigh = 0.0f;
-        
-        float lowAlpha  = 0.0327f;
-        float highAlpha = 0.2618f;
+        float maxBands[6]{};
         
         HRESULT packetHr = S_OK;
         while (true) {
@@ -5428,40 +5842,53 @@ void AudioService::UpdateLoopback() {
                             return static_cast<float>(static_cast<double>(value) / 2147483648.0);
                         };
 
-                        float sumLow = 0.0f, sumMid = 0.0f, sumHigh = 0.0f;
-                        UINT n = 0;
-
-                        for (UINT i = 0; i < numFrames; ++i) {
-                            float s = 0.0f;
-                            for (UINT c = 0; c < channels; ++c) {
-                                s += readSample(i, c);
+                        // Six logarithmically spaced band-pass filters. Each bar
+                        // measures its own range rather than interpolating three broad bands.
+                        const float sampleRate = static_cast<float>(m_pwfx->nSamplesPerSec);
+                        if (sampleRate > 0.0f && std::abs(sampleRate - m_eqFilterSampleRate) > 1.0f) {
+                            constexpr float centers[6] = { 70.0f, 150.0f, 320.0f, 680.0f, 1450.0f, 3100.0f };
+                            constexpr float q = 0.90f;
+                            for (int band = 0; band < 6; ++band) {
+                                BiquadBand& f = m_eqFilters[band];
+                                const float w0 = 6.28318530718f * centers[band] / sampleRate;
+                                const float cosine = std::cos(w0);
+                                const float alpha = std::sin(w0) / (2.0f * q);
+                                const float a0 = 1.0f + alpha;
+                                f.b0 = alpha / a0;
+                                f.b1 = 0.0f;
+                                f.b2 = -alpha / a0;
+                                f.a1 = (-2.0f * cosine) / a0;
+                                f.a2 = (1.0f - alpha) / a0;
+                                f.x1 = f.x2 = f.y1 = f.y2 = 0.0f;
                             }
-                            s /= static_cast<float>(channels);
-                            
-                            m_lpState += lowAlpha * (s - m_lpState);
-                            float low = m_lpState;
-                            
-                            float high = s - m_lpState;
-                            
-                            m_midLpState += highAlpha * (high - m_midLpState);
-                            float mid = m_midLpState;
-                            
-                            float highFinal = high - m_midLpState;
-                            
-                            sumLow  += low * low;
-                            sumMid  += mid * mid;
-                            sumHigh += highFinal * highFinal;
-                            n++;
+                            m_eqFilterSampleRate = sampleRate;
                         }
-                        
+
+                        float sumSquares[6]{};
+                        UINT n = 0;
+                        for (UINT i = 0; i < numFrames; ++i) {
+                            float sample = 0.0f;
+                            for (UINT c = 0; c < channels; ++c) sample += readSample(i, c);
+                            sample /= static_cast<float>(channels);
+
+                            for (int band = 0; band < 6; ++band) {
+                                BiquadBand& f = m_eqFilters[band];
+                                const float y = f.b0 * sample + f.b1 * f.x1 + f.b2 * f.x2
+                                              - f.a1 * f.y1 - f.a2 * f.y2;
+                                f.x2 = f.x1; f.x1 = sample;
+                                f.y2 = f.y1; f.y1 = std::isfinite(y) ? y : 0.0f;
+                                sumSquares[band] += f.y1 * f.y1;
+                            }
+                            ++n;
+                        }
+
                         if (n > 0) {
-                            float rmsLow  = std::sqrt(sumLow  / n) * 18.0f;
-                            float rmsMid  = std::sqrt(sumMid  / n) * 18.0f;
-                            float rmsHigh = std::sqrt(sumHigh / n) * 18.0f;
-                            
-                            if (rmsLow  > maxLow)  maxLow  = rmsLow;
-                            if (rmsMid  > maxMid)  maxMid  = rmsMid;
-                            if (rmsHigh > maxHigh) maxHigh = rmsHigh;
+                            // Conservative gain keeps the six independent bands below the visual ceiling.
+                            constexpr float kEqualizerGain = 4.5f;
+                            for (int band = 0; band < 6; ++band) {
+                                const float rms = std::sqrt(sumSquares[band] / static_cast<float>(n)) * kEqualizerGain;
+                                if (rms > maxBands[band]) maxBands[band] = rms;
+                            }
                         }
                     }
                 }
@@ -5478,25 +5905,14 @@ void AudioService::UpdateLoopback() {
             ResetLoopback();
             return;
         }
-        if (maxLow  > 1.0f) maxLow  = 1.0f;
-        if (maxMid  > 1.0f) maxMid  = 1.0f;
-        if (maxHigh > 1.0f) maxHigh = 1.0f;
-        
-        m_currentRms = (maxLow + maxMid + maxHigh) * 0.333f;
-        
-        auto env = [](float cur, float& smooth) {
-            if (cur > smooth) {
-                smooth = smooth + 0.95f * (cur - smooth);
-            } else {
-                smooth = smooth * 0.78f;
-            }
-        };
-        
-        env(maxLow,  m_lowBandSmooth);
-        env(maxMid,  m_midBandSmooth);
-        env(maxHigh, m_highBandSmooth);
-        
-        env(m_currentRms, m_smoothedRms);
+        for (int band = 0; band < 6; ++band) {
+            const float value = Utils::Clamp(maxBands[band], 0.0f, 1.0f);
+            // Audio-thread envelope: fast attack and smooth release per band.
+            if (value > m_bandSmooth[band])
+                m_bandSmooth[band] += 0.70f * (value - m_bandSmooth[band]);
+            else
+                m_bandSmooth[band] *= 0.82f;
+        }
     }
 }
 
@@ -5948,10 +6364,6 @@ void TimerService::Tick() {
     }
 }
 
-float TimerService::GetProgressFraction() const {
-    if (m_totalSeconds <= 0) return 0.0f;
-    return 1.0f - (static_cast<float>(m_remainingSeconds) / static_cast<float>(m_totalSeconds));
-}
 
 void TimerService::SyncState() {
     if (!m_manager) return;
@@ -6069,8 +6481,8 @@ void LoadSettings() {
         return result;
     };
     
-    g_settings.fontWeightRegular = parseWeight(L"fontWeightRegular", FontWeightPreset::Regular);
-    g_settings.fontWeightBold = parseWeight(L"fontWeightBold", FontWeightPreset::Medium);
+    g_settings.fontWeightRegular = parseWeight(L"fontWeightRegular", FontWeightPreset::Medium);
+    g_settings.fontWeightBold = parseWeight(L"fontWeightBold", FontWeightPreset::Bold);
     
     int fsReg = Wh_GetIntSetting(L"fontSizeRegular");
     if (fsReg >= 8 && fsReg <= 24) g_settings.fontSizeRegular = fsReg;
@@ -6117,7 +6529,7 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
     g_serviceManager->RegisterAudioService(g_audioService.get());
     
     if (GetSettingsSnapshot().enableMedia) g_mediaService->Start();
-    if (GetSettingsSnapshot().enableMicStatus || GetSettingsSnapshot().enableVolumeHUD) g_audioService->Start();
+    if (GetSettingsSnapshot().enableMedia || GetSettingsSnapshot().enableMicStatus || GetSettingsSnapshot().enableVolumeHUD) g_audioService->Start();
     if (GetSettingsSnapshot().enablePowerHUD) g_powerService->Start();
     if (GetSettingsSnapshot().enableCapsLockHUD) g_keyboardService->Start();
     if (GetSettingsSnapshot().enableBluetoothHUD) g_bluetoothService->Start();
@@ -6178,7 +6590,7 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
                 else g_mediaService->Stop();
             }
             if (g_audioService) {
-                if (settings.enableMicStatus || settings.enableVolumeHUD) g_audioService->Start();
+                if (settings.enableMedia || settings.enableMicStatus || settings.enableVolumeHUD) g_audioService->Start();
                 else g_audioService->Stop();
             }
             if (g_powerService) {
