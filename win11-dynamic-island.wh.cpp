@@ -2,7 +2,7 @@
 // @id              win11-dynamic-island
 // @name            Dynamic Island for Windows 11
 // @description     An interactive Dynamic Island overlay and taskbar companion for Windows 11
-// @version         0.1.4
+// @version         0.1.5
 // @author          Tederby and Qhaton
 // @github          https://github.com/qhaton
 // @include         explorer.exe
@@ -87,9 +87,9 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 - enableDebugHotkeys: true
   $name: Enable Debug Hotkeys
   $description: Enable global hotkeys (Ctrl+Win+1..9, 0) to simulate volume, battery, media, and other HUD events.
-- fontFamily: Inter
+- fontFamily: Segoe UI Variable Text
   $name: Font Family
-  $description: Custom font family name (e.g. "Inter", "Segoe UI Variable", "Cascadia Code"). Leave on "Inter" to use the installed Inter font; falls back to the system UI font if the named font is not installed.
+  $description: Custom font family name (e.g. "Inter", "Segoe UI Variable Text", "Segoe UI"). "Segoe UI Variable Text" is the Windows 11 default with proportional digits; if the named font is not installed, the mod falls back to Segoe UI Variable / Segoe UI automatically.
 - fontWeightRegular: regular
   $name: Body Font Weight
   $description: Unused since v0.1.3 — all text now renders with the Emphasis Font Weight so every label and digit matches the compact track title typography.
@@ -282,7 +282,7 @@ struct ModSettings {
     bool enableDebugHotkeys = true;
     int autoCollapseDelayMs = 1500;
     float animationSpeed = 1.0f;
-    std::wstring fontFamily = L"Inter";
+    std::wstring fontFamily = L"Segoe UI Variable Text";
     FontWeightPreset fontWeightRegular = FontWeightPreset::Regular;
     FontWeightPreset fontWeightBold = FontWeightPreset::Medium;
     int fontSizeRegular = 12;
@@ -1179,8 +1179,18 @@ static bool IsFontFamilyInstalled(const wchar_t* familyName) {
 }
 
 std::wstring GetSystemUiFontFamily() {
+    // Prefer the modern Windows 11 font stack: its proportional digits are the
+    // closest visual match to the iOS look. Legacy "MS Shell Dlg 2" substitutes
+    // such as Tahoma render boxy, tabular-looking digits, so they are only a
+    // last-resort fallback.
     if (IsFontFamilyInstalled(L"Inter")) {
         return L"Inter";
+    }
+    if (IsFontFamilyInstalled(L"Segoe UI Variable")) {
+        return L"Segoe UI Variable Text";
+    }
+    if (IsFontFamilyInstalled(L"Segoe UI")) {
+        return L"Segoe UI";
     }
     HKEY hKey = nullptr;
     std::wstring font = L"Segoe UI";
@@ -1380,6 +1390,23 @@ inline D2D1_POINT_2F Pt(float x, float y, const D2D1_RECT_F& bounds) {
     return D2D1::Point2F(ScaleX(x, bounds), ScaleY(y, bounds));
 }
 
+// A shared stroke style with round joins/caps: combined with a fill it rounds
+// every corner of an icon polygon, matching the iOS (SF Symbols) look.
+Microsoft::WRL::ComPtr<ID2D1StrokeStyle> CreateRoundStrokeStyle(ID2D1Factory* factory) {
+    Microsoft::WRL::ComPtr<ID2D1StrokeStyle> style;
+    if (!factory) return style;
+    
+    D2D1_STROKE_STYLE_PROPERTIES props{};
+    props.lineJoin = D2D1_LINE_JOIN_ROUND;
+    props.miterLimit = 10.0f;
+    props.startCap = D2D1_CAP_STYLE_ROUND;
+    props.endCap = D2D1_CAP_STYLE_ROUND;
+    props.dashCap = D2D1_CAP_STYLE_ROUND;
+    
+    factory->CreateStrokeStyle(&props, nullptr, 0, style.GetAddressOf());
+    return style;
+}
+
 void DrawPolygon(
     ID2D1RenderTarget* rt,
     ID2D1Factory* factory,
@@ -1396,7 +1423,23 @@ void DrawPolygon(
             sink->AddLines(&points[1], count - 1);
             sink->EndFigure(D2D1_FIGURE_END_CLOSED);
             sink->Close();
+            
             rt->FillGeometry(path.Get(), brush);
+            
+            // Stroke the same outline with a round join so sharp corners become
+            // rounded, matching filled iOS (SF Symbols) icons. The corner radius
+            // is proportional to the rendered icon size.
+            D2D1_RECT_F pathBounds{};
+            if (SUCCEEDED(path->GetBounds(nullptr, &pathBounds))) {
+                const float bw = pathBounds.right - pathBounds.left;
+                const float bh = pathBounds.bottom - pathBounds.top;
+                const float side = (bw < bh) ? bw : bh;
+                const float strokeW = side * 0.14f;
+                if (strokeW > 0.5f) {
+                    auto strokeStyle = CreateRoundStrokeStyle(factory);
+                    rt->DrawGeometry(path.Get(), brush, strokeW, strokeStyle.Get());
+                }
+            }
         }
     }
 }
@@ -1418,7 +1461,10 @@ void DrawPolyline(
             sink->AddLines(&points[1], count - 1);
             sink->EndFigure(D2D1_FIGURE_END_OPEN);
             sink->Close();
-            rt->DrawGeometry(path.Get(), brush, strokeWidth);
+            // Round caps and joins give the open strokes (Bluetooth rune) the
+            // soft iOS look instead of flat, sharp ends.
+            auto strokeStyle = CreateRoundStrokeStyle(factory);
+            rt->DrawGeometry(path.Get(), brush, strokeWidth, strokeStyle.Get());
         }
     }
 }
@@ -1437,51 +1483,57 @@ void DrawIcon(
     
     switch (type) {
         case IconType::Play: {
+            // Filled iOS play triangle with rounded corners (round-join stroke
+            // in DrawPolygon softens the vertices).
             D2D1_POINT_2F pts[] = {
-                Pt(8.0f, 5.0f, bounds),
-                Pt(8.0f, 19.0f, bounds),
-                Pt(19.0f, 12.0f, bounds)
+                Pt(8.2f, 5.6f, bounds),
+                Pt(8.2f, 18.4f, bounds),
+                Pt(18.4f, 12.0f, bounds)
             };
             DrawPolygon(rt, factory, brush, pts, 3);
             break;
         }
         case IconType::Pause: {
+            // Two fully rounded vertical bars, like iOS "pause.fill".
             D2D1_RECT_F r1 = D2D1::RectF(
                 ScaleX(6.0f, bounds), ScaleY(5.0f, bounds),
-                ScaleX(10.0f, bounds), ScaleY(19.0f, bounds)
+                ScaleX(10.2f, bounds), ScaleY(19.0f, bounds)
             );
             D2D1_RECT_F r2 = D2D1::RectF(
-                ScaleX(14.0f, bounds), ScaleY(5.0f, bounds),
+                ScaleX(13.8f, bounds), ScaleY(5.0f, bounds),
                 ScaleX(18.0f, bounds), ScaleY(19.0f, bounds)
             );
-            rt->FillRectangle(r1, brush);
-            rt->FillRectangle(r2, brush);
+            const float barRadius = (bounds.right - bounds.left) * (1.5f / 24.0f);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(r1, barRadius, barRadius), brush);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(r2, barRadius, barRadius), brush);
             break;
         }
         case IconType::Previous: {
             D2D1_RECT_F bar = D2D1::RectF(
                 ScaleX(6.0f, bounds), ScaleY(6.0f, bounds),
-                ScaleX(8.0f, bounds), ScaleY(18.0f, bounds)
+                ScaleX(8.4f, bounds), ScaleY(18.0f, bounds)
             );
-            rt->FillRectangle(bar, brush);
+            const float barRadius = (bounds.right - bounds.left) * (1.2f / 24.0f);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(bar, barRadius, barRadius), brush);
             D2D1_POINT_2F pts[] = {
-                Pt(9.0f, 12.0f, bounds),
-                Pt(18.0f, 6.0f, bounds),
-                Pt(18.0f, 18.0f, bounds)
+                Pt(17.6f, 6.8f, bounds),
+                Pt(17.6f, 17.2f, bounds),
+                Pt(9.6f, 12.0f, bounds)
             };
             DrawPolygon(rt, factory, brush, pts, 3);
             break;
         }
         case IconType::Next: {
             D2D1_RECT_F bar = D2D1::RectF(
-                ScaleX(16.0f, bounds), ScaleY(6.0f, bounds),
+                ScaleX(15.6f, bounds), ScaleY(6.0f, bounds),
                 ScaleX(18.0f, bounds), ScaleY(18.0f, bounds)
             );
-            rt->FillRectangle(bar, brush);
+            const float barRadius = (bounds.right - bounds.left) * (1.2f / 24.0f);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(bar, barRadius, barRadius), brush);
             D2D1_POINT_2F pts[] = {
-                Pt(6.0f, 6.0f, bounds),
-                Pt(15.0f, 12.0f, bounds),
-                Pt(6.0f, 18.0f, bounds)
+                Pt(6.4f, 6.8f, bounds),
+                Pt(6.4f, 17.2f, bounds),
+                Pt(14.4f, 12.0f, bounds)
             };
             DrawPolygon(rt, factory, brush, pts, 3);
             break;
@@ -1652,6 +1704,20 @@ bool D2DRenderer::Initialize(HWND hwnd) {
         }
         if (!installed) {
             fontFamily = Utils::GetSystemUiFontFamily();
+        }
+    }
+    
+    // Final validation: the resolved family (including the auto-detected one)
+    // must be loadable by DirectWrite, otherwise D2D would silently draw
+    // nothing for those runs.
+    if (!fontFamily.empty()) {
+        ComPtr<IDWriteFontCollection> collection;
+        if (SUCCEEDED(m_dwriteFactory->GetSystemFontCollection(collection.GetAddressOf()))) {
+            UINT32 idx = 0;
+            BOOL exists = FALSE;
+            if (SUCCEEDED(collection->FindFamilyName(fontFamily.c_str(), &idx, &exists)) && !exists) {
+                fontFamily = L"Segoe UI";
+            }
         }
     }
     
@@ -5985,7 +6051,7 @@ void LoadSettings() {
     }
     
     if (g_settings.fontFamily.empty()) {
-        g_settings.fontFamily = L"Inter";
+        g_settings.fontFamily = L"Segoe UI Variable Text";
     }
     
     auto parseWeight = [](PCWSTR name, FontWeightPreset def) -> FontWeightPreset {
