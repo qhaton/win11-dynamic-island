@@ -930,6 +930,7 @@ public:
     
     void Play();
     void Pause();
+    bool TogglePlayPause();
     void Next();
     void Previous();
     void Seek(float progressFraction);
@@ -954,6 +955,12 @@ private:
     std::atomic<bool> m_pollStop{false};
     
     mutable std::mutex m_thumbMutex;
+    // Keep the UI responsive while the asynchronous GSMTC command reaches the player.
+    // These fields are protected by m_thumbMutex and prevent stale polling results
+    // from briefly reverting an optimistic play/pause toggle.
+    bool m_hasPendingPlaybackOverride = false;
+    bool m_pendingPlaybackOverride = false;
+    ULONGLONG m_pendingPlaybackOverrideUntilTick = 0;
     mutable std::mutex m_sessionMutex;
     std::mutex m_thumbWorkerMutex;
     std::condition_variable m_thumbWorkerCv;
@@ -1538,14 +1545,20 @@ struct IconGlyph {
 
 // --- play ---
 constexpr IconSeg kPLAYSegs[] = {
-    { SEG_CUBIC, 9.051f, 6.286f, 7.6f, 4.833f, 8.084f, 5.695f },
-    { SEG_LINE,  19.851f, 12.886f },
-    { SEG_CUBIC, 16.949f, 12.886f, 18.884f, 12.295f, 17.916f, 12.295f },
-    { SEG_LINE,  6.149f, 19.486f },
-    { SEG_CUBIC, 7.6f, 16.9f, 7.116f, 18.895f, 7.6f, 18.033f },
+    // Rounded rear/top corner of the play triangle.
+    { SEG_CUBIC, 9.15f, 4.05f, 8.55f, 3.55f, 8.90f, 3.70f },
+    { SEG_LINE,  18.25f, 10.15f },
+    // Broad cubic nose gives the arrow tip a visible, smooth radius.
+    { SEG_CUBIC, 18.25f, 13.85f, 19.75f, 11.10f, 19.75f, 12.90f },
+    { SEG_LINE,  9.15f, 19.95f },
+    // Rounded lower/rear corners.
+    { SEG_CUBIC, 7.80f, 20.30f, 8.90f, 20.30f, 8.55f, 20.45f },
+    { SEG_CUBIC, 6.20f, 18.90f, 6.20f, 19.80f, 6.20f, 19.25f },
+    { SEG_LINE,  6.20f, 5.10f },
+    { SEG_CUBIC, 7.80f, 3.70f, 6.20f, 4.00f, 6.80f, 3.70f },
 };
 constexpr IconFigure kPLAYFigs[] = {
-    { kPLAYSegs, _countof(kPLAYSegs), { 7.6f, 3.7f } },
+    { kPLAYSegs, _countof(kPLAYSegs), { 7.80f, 3.70f } },
 };
 
 // --- pause ---
@@ -2790,15 +2803,9 @@ void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, f
     float h = bounds.bottom - bounds.top;
     
     D2D1_POINT_2F center = D2D1::Point2F(bounds.left + w / 2.0f, bounds.top + h / 2.0f);
-    float radius = (w < h ? w : h) / 2.0f;
-    
     hoverProgress = Utils::Clamp(hoverProgress, 0.0f, 1.0f);
-    if (hoverProgress > 0.001f) {
-        m_solidBrush->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f * hoverProgress));
-        m_dcRenderTarget->FillEllipse(D2D1::Ellipse(center, radius, radius), m_solidBrush.Get());
-    }
-    
-    // A small scale-up accompanies the fading highlight on hover.
+
+    // Hover feedback is icon-only: no circular background is drawn.
     float iconSize = 22.0f * iconScale * (1.0f + 0.045f * hoverProgress);
     D2D1_RECT_F iconBounds = D2D1::RectF(
         center.x - iconSize / 2.0f,
@@ -2823,14 +2830,9 @@ void D2DRenderer::DrawCircularButtonTransition(
     const float w = bounds.right - bounds.left;
     const float h = bounds.bottom - bounds.top;
     const D2D1_POINT_2F center = D2D1::Point2F(bounds.left + w / 2.0f, bounds.top + h / 2.0f);
-    const float radius = (w < h ? w : h) / 2.0f;
-
     hoverProgress = Utils::Clamp(hoverProgress, 0.0f, 1.0f);
-    if (hoverProgress > 0.001f) {
-        m_solidBrush->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f * hoverProgress));
-        m_dcRenderTarget->FillEllipse(D2D1::Ellipse(center, radius, radius), m_solidBrush.Get());
-    }
 
+    // Keep the hover animation on the glyph only; do not draw a circular backdrop.
     const float baseIconSize = 22.0f * iconScale * (1.0f + 0.045f * hoverProgress);
     const float progress = Utils::Clamp(transitionProgress, 0.0f, 1.0f);
     auto drawScaledGlyph = [&](IconType icon, float scale, float alpha) {
@@ -4591,10 +4593,8 @@ void ServiceManager::UpdateMicState(const MicState& state) {
 }
 
 void ServiceManager::OnMediaPlayPause() {
-    if (m_mediaService && m_mediaService->HasRealSession()) {
-        if (m_mediaService->IsPlaying()) m_mediaService->Pause();
-        else m_mediaService->Play();
-        return; // MediaService publishes the optimistic state exactly once.
+    if (m_mediaService && m_mediaService->TogglePlayPause()) {
+        return;
     }
 
     // Demo/fallback state when no real system media session is available.
@@ -5811,6 +5811,20 @@ void MediaService::PollThreadProcInternal() {
                         bool mediaStateChanged = false;
                         {
                             std::lock_guard<std::mutex> lock(m_thumbMutex);
+                            if (m_hasPendingPlaybackOverride) {
+                                const ULONGLONG nowTick = GetTickCount64();
+                                if (nowTick <= m_pendingPlaybackOverrideUntilTick) {
+                                    if (isPlaying == m_pendingPlaybackOverride) {
+                                        // The media session has acknowledged our requested state.
+                                        m_hasPendingPlaybackOverride = false;
+                                    } else {
+                                        // Ignore a stale poll result while the command is in flight.
+                                        isPlaying = m_pendingPlaybackOverride;
+                                    }
+                                } else {
+                                    m_hasPendingPlaybackOverride = false;
+                                }
+                            }
                             mediaStateChanged =
                                 !m_hasRealSession ||
                                 m_state.title != title ||
@@ -5844,6 +5858,8 @@ void MediaService::PollThreadProcInternal() {
                         }
                     } else {
                         std::lock_guard<std::mutex> lock(m_thumbMutex);
+                        m_hasPendingPlaybackOverride = false;
+                        m_pendingPlaybackOverrideUntilTick = 0;
                         const bool hadMedia = m_hasRealSession || m_state.isPlaying ||
                                               !m_state.title.empty() || !m_state.artist.empty();
                         m_hasRealSession = false;
@@ -6062,6 +6078,31 @@ void MediaService::Pause() {
         } catch (...) { LogError(L"Unable to issue GSMTC Pause command"); }
     }
 #endif
+}
+
+bool MediaService::TogglePlayPause() {
+    MediaState optimisticState;
+    bool targetPlaying = false;
+    {
+        std::lock_guard<std::mutex> lock(m_thumbMutex);
+        if (!m_hasRealSession) return false;
+
+        targetPlaying = !m_state.isPlaying;
+        m_state.isPlaying = targetPlaying;
+        m_hasPendingPlaybackOverride = true;
+        m_pendingPlaybackOverride = targetPlaying;
+        m_pendingPlaybackOverrideUntilTick = GetTickCount64() + 1500;
+        optimisticState = m_state;
+        m_stateDirty = true;
+    }
+
+    // Update the icon and playback UI immediately; do not wait for the next poll.
+    if (m_manager) m_manager->UpdateMediaState(optimisticState);
+
+    // The system command remains asynchronous, but the visual state is already updated.
+    if (targetPlaying) Play();
+    else Pause();
+    return true;
 }
 
 void MediaService::Next() {
