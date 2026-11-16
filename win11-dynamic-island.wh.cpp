@@ -2,7 +2,7 @@
 // @id              win11-dynamic-island
 // @name            Dynamic Island for Windows 11
 // @description     An interactive Dynamic Island overlay and taskbar companion for Windows 11
-// @version         0.1.19
+// @version         0.1.30
 // @author          Tederby and Qhaton
 // @github          https://github.com/qhaton
 // @include         explorer.exe
@@ -60,6 +60,9 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 - enableMedia: true
   $name: Media Controls & Now Playing
   $description: Show active media playback, track marquee, equalizer, and playback controls.
+- enableOnlineArtworkLookup: false
+  $name: Online Album Artwork Lookup
+  $description: Allow sending track title and artist to Apple iTunes Search when local artwork is unavailable.
 - enableTimer: true
   $name: Focus Timer
   $description: Enable focus session countdown timer with progress ring.
@@ -143,6 +146,7 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <audioclient.h>
+#include <audiopolicy.h>
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <windowsx.h>
@@ -154,6 +158,32 @@ and expanded to cover full multi-edge taskbars, rich interactive states, and an 
 #include <setupapi.h>
 #include <devpkey.h>
 #include <winhttp.h>
+
+// Move-only RAII wrapper for Win32 kernel handles.
+class UniqueWinHandle {
+public:
+    UniqueWinHandle() noexcept = default;
+    explicit UniqueWinHandle(HANDLE value) noexcept : m_value(value) {}
+    ~UniqueWinHandle() { reset(); }
+    UniqueWinHandle(const UniqueWinHandle&) = delete;
+    UniqueWinHandle& operator=(const UniqueWinHandle&) = delete;
+    UniqueWinHandle(UniqueWinHandle&& other) noexcept : m_value(other.release()) {}
+    UniqueWinHandle& operator=(UniqueWinHandle&& other) noexcept {
+        if (this != &other) reset(other.release());
+        return *this;
+    }
+    UniqueWinHandle& operator=(HANDLE value) noexcept { reset(value); return *this; }
+    operator HANDLE() const noexcept { return m_value; }
+    explicit operator bool() const noexcept { return m_value && m_value != INVALID_HANDLE_VALUE; }
+    HANDLE get() const noexcept { return m_value; }
+    HANDLE release() noexcept { HANDLE value = m_value; m_value = nullptr; return value; }
+    void reset(HANDLE value = nullptr) noexcept {
+        if (m_value && m_value != INVALID_HANDLE_VALUE) CloseHandle(m_value);
+        m_value = value;
+    }
+private:
+    HANDLE m_value = nullptr;
+};
 
 // Windows DEVPKEY_Device_BatteryLevel property key.
 DEFINE_DEVPROPKEY(DEVPKEY_Device_BatteryLevel,
@@ -273,6 +303,7 @@ struct ModSettings {
     IdleVisibilityMode idleVisibilityMode = IdleVisibilityMode::AlwaysVisible;
     MediaVisibilityPolicy mediaVisibilityPolicy = MediaVisibilityPolicy::AlwaysVisible;
     bool enableMedia = true;
+    bool enableOnlineArtworkLookup = false;
     bool enableTimer = true;
     bool enableMicStatus = true;
     bool enableVolumeHUD = true;
@@ -456,7 +487,7 @@ public:
     bool Initialize(HWND hwnd);
     void Cleanup();
     void Resize(UINT width, UINT height);
-    void BeginDraw();
+    bool BeginDraw();
     HRESULT EndDraw();
     bool PresentLayeredWindow(HWND hwnd, int winX, int winY);
     
@@ -484,6 +515,7 @@ private:
     HWND m_hwnd = nullptr;
     ComPtr<ID2D1Factory> m_d2dFactory;
     ComPtr<IDWriteFactory> m_dwriteFactory;
+    bool m_isDrawing = false;
     ComPtr<ID2D1DCRenderTarget> m_dcRenderTarget;
     ComPtr<ID2D1SolidColorBrush> m_solidBrush;
     ComPtr<ID2D1Bitmap> m_albumArtBitmap;
@@ -637,6 +669,7 @@ public:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 private:
+    static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     HWND m_hwnd = nullptr;
     IslandState m_state = IslandState::Hidden;
     EventType m_currentEvent = EventType::None;
@@ -792,7 +825,7 @@ private:
     std::deque<QueuedEvent> m_transientQueue;
     bool m_hasActiveTransient = false;
     QueuedEvent m_currentTransient;
-    DWORD m_transientExpiryTick = 0;
+    ULONGLONG m_transientExpiryTick = 0;
     
     bool m_mediaActive = false;
     bool m_timerActive = false;
@@ -820,6 +853,11 @@ private:
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Media.Control.h>
+#if __has_include(<winrt/Windows.Devices.Enumeration.h>) && __has_include(<winrt/Windows.Devices.Bluetooth.h>)
+#define DYNAMIC_ISLAND_HAS_WINRT_DEVICE_WATCHER 1
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Devices.Bluetooth.h>
+#endif
 #endif
 #endif
 
@@ -836,8 +874,6 @@ public:
     void Start();
     void Stop();
     void Poll();
-    
-    const MediaState& GetState() const { return m_state; }
     
     MediaState SnapshotState() const {
         std::lock_guard<std::mutex> lock(m_thumbMutex);
@@ -872,7 +908,7 @@ private:
     std::atomic<bool> m_isRunning{false};
     std::atomic<bool> m_hasRealSession{false};
     
-    HANDLE m_pollThread = nullptr;
+    UniqueWinHandle m_pollThread;
     DWORD  m_pollThreadId = 0;
     std::atomic<bool> m_pollStop{false};
     
@@ -924,6 +960,14 @@ private:
     winrt::Windows::Storage::Streams::IRandomAccessStreamReference m_pendingThumbRef{nullptr};
     std::wstring m_pendingTrackId;
     double m_lastSessionsRefreshMs = 0.0;
+    std::atomic<bool> m_sessionsChanged{true};
+    std::atomic<bool> m_sessionDataChanged{true};
+    winrt::event_token m_sessionsChangedToken{};
+    winrt::event_token m_playbackInfoChangedToken{};
+    winrt::event_token m_mediaPropertiesChangedToken{};
+    winrt::event_token m_timelinePropertiesChangedToken{};
+    void DetachSessionEvents() noexcept;
+    void AttachSessionEvents(const winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession& session);
     
     void TriggerAsyncThumbnailFetch(winrt::Windows::Storage::Streams::IRandomAccessStreamReference thumbRef, const std::wstring& trackId);
 #endif
@@ -951,22 +995,34 @@ public:
     void CheckMicUsage();
     void PollVolume();
     void SetVolume(float volume);
-    void UpdateLoopback();
+    void SetLoopbackCaptureEnabled(bool enabled);
     void StopLoopbackCapture();
     
     float GetCurrentVolume() const { return m_currentVolume; }
     bool IsMuted() const { return m_isMuted; }
     bool IsMicInUse() const { return m_isMicInUse; }
     
-    float GetBand(size_t index) const { return index < 6 ? m_bandSmooth[index] : 0.0f; }
+    float GetBand(size_t index) const {
+        return index < 6 ? m_bandSmooth[index].load(std::memory_order_relaxed) : 0.0f;
+    }
 
 private:
     [[maybe_unused]] ServiceManager* m_manager = nullptr;
     float m_currentVolume = 0.5f;
     bool m_isMuted = false;
     bool m_isMicInUse = false;
-    bool m_isRunning = false;
-    
+    std::atomic<bool> m_isRunning{false};
+    std::atomic<bool> m_loopbackRequested{false};
+    UniqueWinHandle m_loopbackThread;
+    UniqueWinHandle m_loopbackWakeEvent;
+    UniqueWinHandle m_audioSamplesReadyEvent;
+    std::wstring m_loopbackDeviceId;
+    ULONGLONG m_lastLoopbackDeviceCheckTick = 0;
+
+    static DWORD WINAPI LoopbackThreadProcStatic(LPVOID param);
+    void LoopbackThreadProc();
+    void UpdateLoopback();
+
     ComPtr<IMMDeviceEnumerator> m_deviceEnumerator;
     ComPtr<IMMDeviceEnumerator> m_volumeDeviceEnumerator;
     ComPtr<IAudioEndpointVolume> m_endpointVolume;
@@ -986,7 +1042,7 @@ private:
     };
     BiquadBand m_eqFilters[6]{};
     float m_eqFilterSampleRate = 0.0f;
-    float m_bandSmooth[6]{};
+    std::atomic<float> m_bandSmooth[6]{};
     float m_lastReportedVolume = -1.0f;
     bool m_lastReportedMute = false;
     bool m_hasReportedVolume = false;
@@ -1085,10 +1141,24 @@ public:
 
 private:
     ServiceManager* m_manager = nullptr;
-    bool m_isRunning = false;
+    std::atomic<bool> m_isRunning{false};
     bool m_baselineDone = false;
     std::unordered_set<std::wstring> m_knownConnected;
     ULONGLONG m_lastPollTick = 0;
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_DEVICE_WATCHER)
+    winrt::Windows::Devices::Enumeration::DeviceWatcher m_deviceWatcher{nullptr};
+    winrt::event_token m_watcherAddedToken{};
+    winrt::event_token m_watcherUpdatedToken{};
+    winrt::event_token m_watcherRemovedToken{};
+    winrt::event_token m_watcherEnumerationToken{};
+    std::mutex m_watcherMutex;
+    std::unordered_map<std::wstring, std::wstring> m_watcherConnected;
+    bool m_watcherBaselineDone = false;
+    bool m_watcherActive = false;
+    void StartDeviceWatcher();
+    void StopDeviceWatcher();
+    void OnWatcherDevice(const winrt::Windows::Devices::Enumeration::DeviceInformation& info, bool fromUpdate);
+#endif
 };
 } // namespace Services
 } // namespace DynamicIsland
@@ -2037,15 +2107,24 @@ bool D2DRenderer::CreateDeviceResources() {
         }
     }
     
-    m_dcRenderTarget->CreateSolidColorBrush(
+    hr = m_dcRenderTarget->CreateSolidColorBrush(
         D2D1::ColorF(D2D1::ColorF::White),
         m_solidBrush.GetAddressOf()
     );
-    
+    if (FAILED(hr) || !m_solidBrush) {
+        LogError(L"Failed to create Direct2D solid brush (HRESULT=0x%08X)",
+                 static_cast<unsigned>(hr));
+        DiscardDeviceResources();
+        return false;
+    }
+
     return true;
 }
 
 void D2DRenderer::DiscardDeviceResources() {
+    // Device resources are discarded only after EndDraw reports a recreate
+    // target condition, but reset defensively for all cleanup paths.
+    m_isDrawing = false;
     m_albumArtBrush.Reset();
     m_albumArtBitmap.Reset();
     m_solidBrush.Reset();
@@ -2119,20 +2198,34 @@ void D2DRenderer::Resize(UINT width, UINT height) {
     }
 }
 
-void D2DRenderer::BeginDraw() {
-    CreateDeviceResources();
-    if (!m_dcRenderTarget || !m_memDC || !m_hBitmap) return;
-    
-    RECT rc = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
-    HRESULT hr = m_dcRenderTarget->BindDC(m_memDC, &rc);
-    if (SUCCEEDED(hr)) {
-        m_dcRenderTarget->BeginDraw();
+bool D2DRenderer::BeginDraw() {
+    if (m_isDrawing) {
+        LogError(L"D2D BeginDraw called while a frame is already active");
+        return false;
     }
+
+    if (!CreateDeviceResources() || !m_dcRenderTarget || !m_memDC ||
+        !m_hBitmap || m_width == 0 || m_height == 0) {
+        return false;
+    }
+
+    RECT rc = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
+    const HRESULT bindHr = m_dcRenderTarget->BindDC(m_memDC, &rc);
+    if (FAILED(bindHr)) {
+        LogError(L"ID2D1DCRenderTarget::BindDC failed (HRESULT=0x%08X)",
+                 static_cast<unsigned>(bindHr));
+        return false;
+    }
+
+    m_dcRenderTarget->BeginDraw();
+    m_isDrawing = true;
+    return true;
 }
 
 HRESULT D2DRenderer::EndDraw() {
-    if (!m_dcRenderTarget) return E_FAIL;
-    
+    if (!m_isDrawing || !m_dcRenderTarget) return E_UNEXPECTED;
+    m_isDrawing = false;
+
     HRESULT hr = m_dcRenderTarget->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) {
         DiscardDeviceResources();
@@ -2904,23 +2997,36 @@ static constexpr int HOTKEY_ID_BASE = 5100;
 
 void IslandWindow::RegisterHotkeys() {
     if (!m_hwnd || m_hotkeysRegistered) return;
-    
+
+    int registeredCount = 0;
     for (int i = 0; i <= 9; ++i) {
-        UINT vk = (i == 9) ? '0' : static_cast<UINT>('1' + i);
-        RegisterHotKey(m_hwnd, HOTKEY_ID_BASE + i, MOD_CONTROL | MOD_WIN, vk);
+        const UINT vk = (i == 9) ? '0' : static_cast<UINT>('1' + i);
+        if (RegisterHotKey(m_hwnd, HOTKEY_ID_BASE + i, MOD_CONTROL | MOD_WIN, vk)) {
+            ++registeredCount;
+        } else {
+            LogError(L"RegisterHotKey failed for Ctrl+Win+%c (error=%lu)",
+                     static_cast<wchar_t>(vk), GetLastError());
+        }
     }
-    
-    m_hotkeysRegistered = true;
-    LogInfo(L"Global test hotkeys registered (Ctrl+Win+1..9, 0)");
+
+    m_hotkeysRegistered = (registeredCount == 10);
+    if (m_hotkeysRegistered) {
+        LogInfo(L"Global test hotkeys registered (Ctrl+Win+1..9, 0)");
+    } else if (registeredCount > 0) {
+        LogError(L"Only %d of 10 debug hotkeys could be registered; rolling back", registeredCount);
+        for (int i = 0; i <= 9; ++i) {
+            UnregisterHotKey(m_hwnd, HOTKEY_ID_BASE + i);
+        }
+    }
 }
 
 void IslandWindow::UnregisterHotkeys() {
-    if (!m_hwnd || !m_hotkeysRegistered) return;
-    
+    if (!m_hwnd) return;
+
     for (int i = 0; i <= 9; ++i) {
         UnregisterHotKey(m_hwnd, HOTKEY_ID_BASE + i);
     }
-    
+
     m_hotkeysRegistered = false;
 }
 
@@ -3642,7 +3748,9 @@ void IslandWindow::Render() {
     
     UpdateEqualizerSmoothing();
     
-    m_renderer->BeginDraw();
+    if (!m_renderer->BeginDraw()) {
+        return;
+    }
     m_renderer->Clear(D2D1::ColorF(0, 0, 0, 0.0f));
     
     float w = m_animWidth.GetValue();
@@ -3893,11 +4001,24 @@ void IslandWindow::Render() {
         }
     }
     
-    m_renderer->EndDraw();
-    m_renderer->PresentLayeredWindow(m_hwnd, m_windowX, m_windowY);
+    const HRESULT drawHr = m_renderer->EndDraw();
+    if (SUCCEEDED(drawHr)) {
+        m_renderer->PresentLayeredWindow(m_hwnd, m_windowX, m_windowY);
+    }
 }
 
 LRESULT CALLBACK IslandWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    try {
+        return WndProcImpl(hwnd, msg, wParam, lParam);
+    } catch (const std::exception& e) {
+        LogError(L"Unhandled C++ exception in window procedure: %S", e.what());
+    } catch (...) {
+        LogError(L"Unhandled unknown exception in window procedure");
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK IslandWindow::WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     IslandWindow* self = nullptr;
     
     if (msg == WM_NCCREATE) {
@@ -4119,7 +4240,7 @@ EqBands ServiceManager::GetAudioBands() const {
 void ServiceManager::PostTransientEvent(const QueuedEvent& event) {
     if (m_hasActiveTransient && m_currentTransient.type == event.type) {
         m_currentTransient = event;
-        m_transientExpiryTick = GetTickCount() + event.durationMs;
+        m_transientExpiryTick = GetTickCount64() + static_cast<ULONGLONG>(event.durationMs);
         
         auto it = m_transientQueue.begin();
         while (it != m_transientQueue.end()) {
@@ -4148,8 +4269,21 @@ void ServiceManager::PostTransientEvent(const QueuedEvent& event) {
         return;
     }
     
+    // Coalesce repeated queued notifications of the same type to keep the
+    // queue bounded under high-frequency event sources.
+    for (auto& queued : m_transientQueue) {
+        if (queued.type == event.type) {
+            queued = event;
+            return;
+        }
+    }
+
+    constexpr size_t kMaxTransientQueue = 32;
+    if (m_transientQueue.size() >= kMaxTransientQueue) {
+        m_transientQueue.pop_front();
+    }
     m_transientQueue.push_back(event);
-    
+
     if (!m_hasActiveTransient) {
         PumpNextEvent();
     }
@@ -4232,7 +4366,7 @@ void ServiceManager::PumpNextEvent() {
     m_currentTransient = m_transientQueue.front();
     m_transientQueue.pop_front();
     m_hasActiveTransient = true;
-    m_transientExpiryTick = GetTickCount() + m_currentTransient.durationMs;
+    m_transientExpiryTick = GetTickCount64() + static_cast<ULONGLONG>(m_currentTransient.durationMs);
     
     if (m_window) {
         TransientState ts;
@@ -4260,7 +4394,7 @@ bool ServiceManager::GetMediaThumbnail(std::vector<uint8_t>& pixels, uint32_t& w
 
 void ServiceManager::Update() {
     if (m_hasActiveTransient) {
-        if (GetTickCount() >= m_transientExpiryTick) {
+        if (GetTickCount64() >= m_transientExpiryTick) {
             PumpNextEvent();
         }
     }
@@ -4829,30 +4963,119 @@ std::wstring PercentEncodeUtf8(const std::wstring& text) {
     return out;
 }
 
-std::wstring ExtractFirstJsonStringValue(const std::string& json, const char* key) {
-    const std::string needle = std::string("\"") + key + "\":";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) return std::wstring();
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
-    if (pos >= json.size() || json[pos] != '"') return std::wstring();
+namespace {
+bool ParseJsonStringToken(const std::string& json, size_t& pos, std::string& utf8) {
+    if (pos >= json.size() || json[pos] != '"') return false;
     ++pos;
-    
-    std::string value;
-    while (pos < json.size() && json[pos] != '"') {
-        if (json[pos] == '\\' && pos + 1 < json.size()) {
-            const char next = json[pos + 1];
-            if (next == '/' || next == '"' || next == '\\') {
-                value += next;
-                pos += 2;
-                continue;
-            }
+    utf8.clear();
+
+    auto appendCodePoint = [&utf8](uint32_t cp) {
+        if (cp <= 0x7F) {
+            utf8.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FF) {
+            utf8.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0xFFFF) {
+            utf8.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            utf8.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0x10FFFF) {
+            utf8.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            utf8.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
         }
-        value += json[pos];
-        ++pos;
+    };
+
+    auto readHex4 = [&json, &pos](uint32_t& value) -> bool {
+        if (pos + 4 > json.size()) return false;
+        value = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char c = json[pos++];
+            value <<= 4;
+            if (c >= '0' && c <= '9') value |= static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') value |= static_cast<uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') value |= static_cast<uint32_t>(c - 'A' + 10);
+            else return false;
+        }
+        return true;
+    };
+
+    while (pos < json.size()) {
+        const unsigned char c = static_cast<unsigned char>(json[pos++]);
+        if (c == '"') return true;
+        if (c < 0x20) return false;
+        if (c != '\\') {
+            utf8.push_back(static_cast<char>(c));
+            continue;
+        }
+        if (pos >= json.size()) return false;
+        const char escaped = json[pos++];
+        switch (escaped) {
+            case '"': utf8.push_back('"'); break;
+            case '\\': utf8.push_back('\\'); break;
+            case '/': utf8.push_back('/'); break;
+            case 'b': utf8.push_back('\b'); break;
+            case 'f': utf8.push_back('\f'); break;
+            case 'n': utf8.push_back('\n'); break;
+            case 'r': utf8.push_back('\r'); break;
+            case 't': utf8.push_back('\t'); break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!readHex4(cp)) return false;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    if (pos + 2 > json.size() || json[pos] != '\\' || json[pos + 1] != 'u') return false;
+                    pos += 2;
+                    uint32_t low = 0;
+                    if (!readHex4(low) || low < 0xDC00 || low > 0xDFFF) return false;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    return false;
+                }
+                appendCodePoint(cp);
+                break;
+            }
+            default: return false;
+        }
     }
-    return WideFromUtf8(value);
+    return false;
 }
+}
+
+std::wstring ExtractFirstJsonStringValue(const std::string& json, const char* key) {
+    if (!key || !*key) return std::wstring();
+    size_t pos = 0;
+    while (pos < json.size()) {
+        if (json[pos] != '"') {
+            ++pos;
+            continue;
+        }
+
+        std::string token;
+        if (!ParseJsonStringToken(json, pos, token)) return std::wstring();
+
+        size_t lookahead = pos;
+        while (lookahead < json.size() &&
+               (json[lookahead] == ' ' || json[lookahead] == '\t' ||
+                json[lookahead] == '\r' || json[lookahead] == '\n')) {
+            ++lookahead;
+        }
+        if (lookahead >= json.size() || json[lookahead] != ':') continue;
+        if (token != key) continue;
+
+        pos = lookahead + 1;
+        while (pos < json.size() &&
+               (json[pos] == ' ' || json[pos] == '\t' ||
+                json[pos] == '\r' || json[pos] == '\n')) {
+            ++pos;
+        }
+        std::string value;
+        if (!ParseJsonStringToken(json, pos, value)) return std::wstring();
+        return WideFromUtf8(value);
+    }
+    return std::wstring();
+}
+
 bool HttpGetBinary(const std::wstring& url, std::vector<uint8_t>& out, size_t maxBytes) {
     out.clear();
     if (url.empty() || maxBytes == 0) return false;
@@ -4951,7 +5174,7 @@ bool HttpGetBinary(const std::wstring& url, std::vector<uint8_t>& out, size_t ma
 } // namespace
 
 void MediaService::TriggeriTunesArtworkFetch(const std::wstring& trackId, const std::wstring& title, const std::wstring& artist) {
-    if (!m_isRunning) return;
+    if (!m_isRunning || !GetSettingsSnapshot().enableOnlineArtworkLookup) return;
     
     {
         std::lock_guard<std::mutex> lock(m_thumbMutex);
@@ -4970,9 +5193,10 @@ void MediaService::TriggeriTunesArtworkFetch(const std::wstring& trackId, const 
     // Shares the active-worker accounting with GSMTC thumbnail workers so
     // Stop() waits for this fetch too before tearing the service down.
     m_activeThumbnailWorkers.fetch_add(1);
-    HANDLE hThread = CreateThread(nullptr, 0, iTunesArtworkWorkerThreadStatic, ctx, 0, nullptr);
+    UniqueWinHandle hThread(CreateThread(nullptr, 0, iTunesArtworkWorkerThreadStatic, ctx, 0, nullptr));
     if (hThread) {
-        CloseHandle(hThread);
+        // Detached worker handle is closed automatically; active-worker accounting
+        // keeps the owning service alive until the worker exits.
     } else {
         m_isFetchingItunes = false;
         delete ctx;
@@ -5096,8 +5320,7 @@ void MediaService::Stop() {
     if (m_pollThread) {
         // The service object must remain alive until the polling thread exits.
         WaitForSingleObject(m_pollThread, INFINITE);
-        CloseHandle(m_pollThread);
-        m_pollThread = nullptr;
+        m_pollThread.reset();
         m_pollThreadId = 0;
     }
 
@@ -5260,11 +5483,10 @@ void MediaService::TriggerAsyncThumbnailFetch(winrt::Windows::Storage::Streams::
     ctx->trackId = trackId;
 
     m_activeThumbnailWorkers.fetch_add(1);
-    HANDLE hThread = CreateThread(nullptr, 0, ThumbnailWorkerThreadProc, ctx, 0, nullptr);
+    UniqueWinHandle hThread(CreateThread(nullptr, 0, ThumbnailWorkerThreadProc, ctx, 0, nullptr));
     if (hThread) {
-        // Active-worker accounting keeps this service alive until the detached
-        // worker and any queued follow-up thumbnail fetch have completed.
-        CloseHandle(hThread);
+        // UniqueWinHandle closes the detached worker handle automatically;
+        // active-worker accounting keeps the service alive until completion.
     } else {
         m_isFetchingThumbnail = false;
         delete ctx;
@@ -5283,6 +5505,37 @@ DWORD WINAPI MediaService::PollThreadProcStatic(LPVOID param) {
 }
 
 #if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
+
+void MediaService::DetachSessionEvents() noexcept {
+    try {
+        if (m_currentSession) {
+            if (m_playbackInfoChangedToken.value) m_currentSession.PlaybackInfoChanged(m_playbackInfoChangedToken);
+            if (m_mediaPropertiesChangedToken.value) m_currentSession.MediaPropertiesChanged(m_mediaPropertiesChangedToken);
+            if (m_timelinePropertiesChangedToken.value) m_currentSession.TimelinePropertiesChanged(m_timelinePropertiesChangedToken);
+        }
+    } catch (...) { LogError(L"Failed to detach GSMTC session event handlers"); }
+    m_playbackInfoChangedToken = {};
+    m_mediaPropertiesChangedToken = {};
+    m_timelinePropertiesChangedToken = {};
+}
+
+void MediaService::AttachSessionEvents(const winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession& session) {
+    if (!session) return;
+    try {
+        m_playbackInfoChangedToken = session.PlaybackInfoChanged([this](const auto&, const auto&) noexcept {
+            m_sessionDataChanged.store(true, std::memory_order_release);
+        });
+        m_mediaPropertiesChangedToken = session.MediaPropertiesChanged([this](const auto&, const auto&) noexcept {
+            m_sessionDataChanged.store(true, std::memory_order_release);
+        });
+        m_timelinePropertiesChangedToken = session.TimelinePropertiesChanged([this](const auto&, const auto&) noexcept {
+            m_sessionDataChanged.store(true, std::memory_order_release);
+        });
+    } catch (const winrt::hresult_error& e) {
+        LogError(L"Failed to subscribe to GSMTC session events (HRESULT=0x%08X): %s",
+                 static_cast<unsigned>(e.code()), e.message().c_str());
+    } catch (...) { LogError(L"Failed to subscribe to GSMTC session events"); }
+}
 
 void MediaService::PollThreadProcInternal() {
     try {
@@ -5306,7 +5559,11 @@ void MediaService::PollThreadProcInternal() {
                 if (requestOperation.wait_for(std::chrono::seconds(5)) ==
                     winrt::Windows::Foundation::AsyncStatus::Completed) {
                     m_sessionManager = requestOperation.GetResults();
-                    LogInfo(L"GSMTC session manager acquired");
+                    m_sessionsChangedToken = m_sessionManager.SessionsChanged([this](const auto&, const auto&) noexcept {
+                        m_sessionsChanged.store(true, std::memory_order_release);
+                        m_sessionDataChanged.store(true, std::memory_order_release);
+                    });
+                    LogInfo(L"GSMTC session manager acquired; event notifications enabled");
                 } else {
                     requestOperation.Cancel();
                     const ULONGLONG nowTick = GetTickCount64();
@@ -5326,7 +5583,8 @@ void MediaService::PollThreadProcInternal() {
                     std::lock_guard<std::mutex> lock(m_sessionMutex);
                     hasCachedSession = static_cast<bool>(m_currentSession);
                 }
-                bool refreshSessions = (now - m_lastSessionsRefreshMs) >= 3000.0 || !hasCachedSession;
+                bool refreshSessions = m_sessionsChanged.exchange(false, std::memory_order_acq_rel) ||
+                                       (now - m_lastSessionsRefreshMs) >= 15000.0 || !hasCachedSession;
                 
                 if (refreshSessions) {
                     m_lastSessionsRefreshMs = now;
@@ -5346,32 +5604,55 @@ void MediaService::PollThreadProcInternal() {
                 }
                 
                 if (!session) {
-                    winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession currentSession{nullptr};
-                    {
+                    // Prefer the session Windows currently considers the
+                    // primary media session. Only retain the previous session
+                    // if the manager temporarily reports no current session.
+                    session = m_sessionManager.GetCurrentSession();
+                    if (!session) {
                         std::lock_guard<std::mutex> lock(m_sessionMutex);
-                        currentSession = m_currentSession;
+                        session = m_currentSession;
                     }
-                    session = currentSession ? currentSession : m_sessionManager.GetCurrentSession();
                 }
 
+                bool sessionChanged = false;
                 {
                     std::lock_guard<std::mutex> lock(m_sessionMutex);
-                    m_currentSession = session;
+                    sessionChanged = (m_currentSession != session);
+                    if (sessionChanged) {
+                        DetachSessionEvents();
+                        m_currentSession = session;
+                        AttachSessionEvents(session);
+                        m_sessionDataChanged.store(true, std::memory_order_release);
+                    } else {
+                        m_currentSession = session;
+                    }
                 }
                 
                 if (session) {
-                    auto propertiesOperation = session.TryGetMediaPropertiesAsync();
-                    if (propertiesOperation.wait_for(std::chrono::seconds(5)) !=
-                        winrt::Windows::Foundation::AsyncStatus::Completed) {
-                        propertiesOperation.Cancel();
-                        throw winrt::hresult_error(HRESULT_FROM_WIN32(WAIT_TIMEOUT));
+                    winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties props{nullptr};
+                    bool refreshTrackProperties = m_sessionDataChanged.exchange(false, std::memory_order_acq_rel) || sessionChanged;
+                    if (refreshTrackProperties) {
+                        auto propertiesOperation = session.TryGetMediaPropertiesAsync();
+                        if (propertiesOperation.wait_for(std::chrono::seconds(5)) !=
+                            winrt::Windows::Foundation::AsyncStatus::Completed) {
+                            propertiesOperation.Cancel();
+                            throw winrt::hresult_error(HRESULT_FROM_WIN32(WAIT_TIMEOUT));
+                        }
+                        props = propertiesOperation.GetResults();
                     }
-                    auto props = propertiesOperation.GetResults();
                     auto info = session.GetPlaybackInfo();
                     auto timeline = session.GetTimelineProperties();
                     
-                    std::wstring title = props ? props.Title().c_str() : L"";
-                    std::wstring artist = props ? props.Artist().c_str() : L"";
+                    std::wstring title, artist;
+                    {
+                        std::lock_guard<std::mutex> lock(m_thumbMutex);
+                        title = m_state.title;
+                        artist = m_state.artist;
+                    }
+                    if (refreshTrackProperties) {
+                        title = props ? props.Title().c_str() : L"";
+                        artist = props ? props.Artist().c_str() : L"";
+                    }
                     bool isPlaying = (info && info.PlaybackStatus() == winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
                     
                     float prog = 0.0f;
@@ -5428,7 +5709,7 @@ void MediaService::PollThreadProcInternal() {
                                 needsThumbnail = true;
                             }
                         }
-                        if (needsThumbnail && m_isRunning) {
+                        if (needsThumbnail && m_isRunning && refreshTrackProperties && props) {
                             TriggerAsyncThumbnailFetch(props.Thumbnail(), currentTrackId);
                         }
                     } else {
@@ -5482,11 +5763,26 @@ void MediaService::PollThreadProcInternal() {
                 std::lock_guard<std::mutex> lock(m_thumbMutex);
                 m_hasRealSession = false;
                 m_state.isPlaying = false;
+                m_state.title.clear();
+                m_state.artist.clear();
+                m_state.progress = 0.0f;
+                m_state.elapsedSeconds = 0;
+                m_state.durationSeconds = 0;
+                m_lastFetchedTrackId.clear();
+                m_thumbPixels.clear();
+                m_thumbWidth = 0;
+                m_thumbHeight = 0;
+                ++m_thumbVersion;
                 m_stateDirty = true;
             }
             {
                 std::lock_guard<std::mutex> lock(m_sessionMutex);
+                DetachSessionEvents();
                 m_currentSession = nullptr;
+            }
+            if (m_sessionManager && m_sessionsChangedToken.value) {
+                try { m_sessionManager.SessionsChanged(m_sessionsChangedToken); } catch (...) {}
+                m_sessionsChangedToken = {};
             }
             m_sessionManager = nullptr;
         } catch (...) {
@@ -5499,11 +5795,26 @@ void MediaService::PollThreadProcInternal() {
                 std::lock_guard<std::mutex> lock(m_thumbMutex);
                 m_hasRealSession = false;
                 m_state.isPlaying = false;
+                m_state.title.clear();
+                m_state.artist.clear();
+                m_state.progress = 0.0f;
+                m_state.elapsedSeconds = 0;
+                m_state.durationSeconds = 0;
+                m_lastFetchedTrackId.clear();
+                m_thumbPixels.clear();
+                m_thumbWidth = 0;
+                m_thumbHeight = 0;
+                ++m_thumbVersion;
                 m_stateDirty = true;
             }
             {
                 std::lock_guard<std::mutex> lock(m_sessionMutex);
+                DetachSessionEvents();
                 m_currentSession = nullptr;
+            }
+            if (m_sessionManager && m_sessionsChangedToken.value) {
+                try { m_sessionManager.SessionsChanged(m_sessionsChangedToken); } catch (...) {}
+                m_sessionsChangedToken = {};
             }
             m_sessionManager = nullptr;
         }
@@ -5513,7 +5824,12 @@ void MediaService::PollThreadProcInternal() {
     
     {
         std::lock_guard<std::mutex> lock(m_sessionMutex);
+        DetachSessionEvents();
         m_currentSession = nullptr;
+    }
+    if (m_sessionManager && m_sessionsChangedToken.value) {
+        try { m_sessionManager.SessionsChanged(m_sessionsChangedToken); } catch (...) {}
+        m_sessionsChangedToken = {};
     }
     m_sessionManager = nullptr;
     winrt::uninit_apartment();
@@ -5560,6 +5876,30 @@ void MediaService::Poll() {
     }
 }
 
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
+template <typename AsyncOperation>
+void ObserveMediaCommand(AsyncOperation operation, const wchar_t* actionName) {
+    operation.Completed([actionName](const auto& completedOperation,
+                                      winrt::Windows::Foundation::AsyncStatus status) noexcept {
+        try {
+            if (status == winrt::Windows::Foundation::AsyncStatus::Completed) {
+                if (!completedOperation.GetResults()) {
+                    LogError(L"GSMTC media command '%s' was rejected by the player", actionName);
+                }
+            } else {
+                LogError(L"GSMTC media command '%s' did not complete (status=%u)",
+                         actionName, static_cast<unsigned>(status));
+            }
+        } catch (const winrt::hresult_error& e) {
+            LogError(L"GSMTC media command '%s' failed (HRESULT=0x%08X): %s",
+                     actionName, static_cast<unsigned>(e.code()), e.message().c_str());
+        } catch (...) {
+            LogError(L"GSMTC media command '%s' failed with an unknown error", actionName);
+        }
+    });
+}
+#endif
+
 void MediaService::Play() {
 #if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
     winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession session{nullptr};
@@ -5568,20 +5908,13 @@ void MediaService::Play() {
         session = m_currentSession;
     }
     if (session) {
-        try { session.TryPlayAsync(); } catch (...) {}
+        try { ObserveMediaCommand(session.TryPlayAsync(), L"Play"); }
+        catch (const winrt::hresult_error& e) {
+            LogError(L"Unable to issue GSMTC Play command (HRESULT=0x%08X): %s",
+                     static_cast<unsigned>(e.code()), e.message().c_str());
+        } catch (...) { LogError(L"Unable to issue GSMTC Play command"); }
     }
 #endif
-    
-    MediaState snap;
-    {
-        std::lock_guard<std::mutex> lock(m_thumbMutex);
-        m_state.isPlaying = true;
-        snap = m_state;
-    }
-    
-    if (m_manager) {
-        m_manager->UpdateMediaState(snap);
-    }
 }
 
 void MediaService::Pause() {
@@ -5592,20 +5925,13 @@ void MediaService::Pause() {
         session = m_currentSession;
     }
     if (session) {
-        try { session.TryPauseAsync(); } catch (...) {}
+        try { ObserveMediaCommand(session.TryPauseAsync(), L"Pause"); }
+        catch (const winrt::hresult_error& e) {
+            LogError(L"Unable to issue GSMTC Pause command (HRESULT=0x%08X): %s",
+                     static_cast<unsigned>(e.code()), e.message().c_str());
+        } catch (...) { LogError(L"Unable to issue GSMTC Pause command"); }
     }
 #endif
-    
-    MediaState snap;
-    {
-        std::lock_guard<std::mutex> lock(m_thumbMutex);
-        m_state.isPlaying = false;
-        snap = m_state;
-    }
-    
-    if (m_manager) {
-        m_manager->UpdateMediaState(snap);
-    }
 }
 
 void MediaService::Next() {
@@ -5616,14 +5942,13 @@ void MediaService::Next() {
         session = m_currentSession;
     }
     if (session) {
-        try { session.TrySkipNextAsync(); } catch (...) {}
+        try { ObserveMediaCommand(session.TrySkipNextAsync(), L"Skip next"); }
+        catch (const winrt::hresult_error& e) {
+            LogError(L"Unable to issue GSMTC Skip next command (HRESULT=0x%08X): %s",
+                     static_cast<unsigned>(e.code()), e.message().c_str());
+        } catch (...) { LogError(L"Unable to issue GSMTC Skip next command"); }
     }
 #endif
-    
-    {
-        std::lock_guard<std::mutex> lock(m_thumbMutex);
-        m_state.progress = 0.0f;
-    }
 }
 
 void MediaService::Previous() {
@@ -5634,19 +5959,18 @@ void MediaService::Previous() {
         session = m_currentSession;
     }
     if (session) {
-        try { session.TrySkipPreviousAsync(); } catch (...) {}
+        try { ObserveMediaCommand(session.TrySkipPreviousAsync(), L"Skip previous"); }
+        catch (const winrt::hresult_error& e) {
+            LogError(L"Unable to issue GSMTC Skip previous command (HRESULT=0x%08X): %s",
+                     static_cast<unsigned>(e.code()), e.message().c_str());
+        } catch (...) { LogError(L"Unable to issue GSMTC Skip previous command"); }
     }
 #endif
-    
-    {
-        std::lock_guard<std::mutex> lock(m_thumbMutex);
-        m_state.progress = 0.0f;
-    }
 }
 
 void MediaService::Seek(float progressFraction) {
     progressFraction = Utils::Clamp(progressFraction, 0.0f, 1.0f);
-    
+
 #if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
     winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession session{nullptr};
     {
@@ -5655,24 +5979,27 @@ void MediaService::Seek(float progressFraction) {
     }
     if (session) {
         try {
-            auto timeline = session.GetTimelineProperties();
+            const auto timeline = session.GetTimelineProperties();
             if (timeline) {
                 const int64_t start = timeline.StartTime().count();
                 const int64_t end = timeline.EndTime().count();
                 const int64_t duration = end - start;
                 if (duration > 0) {
-                    // GSMTC TryChangePlaybackPositionAsync takes absolute position in 100-ns ticks (int64_t).
                     const int64_t targetTicks = start + static_cast<int64_t>(
                         progressFraction * static_cast<double>(duration) + 0.5);
-                    session.TryChangePlaybackPositionAsync(targetTicks);
+                    ObserveMediaCommand(
+                        session.TryChangePlaybackPositionAsync(targetTicks), L"Seek");
                 }
             }
-        } catch (...) {}
+        } catch (const winrt::hresult_error& e) {
+            LogError(L"Unable to issue GSMTC Seek command (HRESULT=0x%08X): %s",
+                     static_cast<unsigned>(e.code()), e.message().c_str());
+        } catch (...) { LogError(L"Unable to issue GSMTC Seek command"); }
     }
 #endif
-    
-    // Optimistic local update so the UI stays responsive even if the player
-    // reports the new position a few hundred milliseconds later.
+
+    // Keep a responsive drag preview. The next authoritative GSMTC snapshot
+    // replaces this value; failed commands are logged by ObserveMediaCommand.
     MediaState snap;
     {
         std::lock_guard<std::mutex> lock(m_thumbMutex);
@@ -5684,10 +6011,7 @@ void MediaService::Seek(float progressFraction) {
         snap = m_state;
         m_stateDirty = true;
     }
-    
-    if (m_manager) {
-        m_manager->UpdateMediaState(snap);
-    }
+    if (m_manager) m_manager->UpdateMediaState(snap);
 }
 } // namespace Services
 } // namespace DynamicIsland
@@ -5699,19 +6023,34 @@ namespace DynamicIsland {
 namespace Services {
 
 AudioService::AudioService(ServiceManager* manager)
-    : m_manager(manager) {}
+    : m_manager(manager) {
+    for (auto& band : m_bandSmooth) {
+        band.store(0.0f, std::memory_order_relaxed);
+    }
+}
 
 AudioService::~AudioService() {
     Stop();
 }
 
 void AudioService::Start() {
-    if (m_isRunning) return;
-    m_isRunning = true;
+    if (m_isRunning.exchange(true)) return;
     m_lastVolumePollTick = 0;
     m_lastVolumeDeviceCheckTick = 0;
     m_lastMicPollTick = 0;
     m_hasReportedVolume = false;
+
+    m_loopbackWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!m_loopbackWakeEvent) {
+        LogError(L"Failed to create audio loopback wake event (error=%lu)", GetLastError());
+    } else {
+        m_loopbackThread = CreateThread(nullptr, 0, LoopbackThreadProcStatic, this, 0, nullptr);
+        if (!m_loopbackThread) {
+            LogError(L"Failed to create audio loopback worker (error=%lu)", GetLastError());
+            m_loopbackWakeEvent.reset();
+            m_loopbackWakeEvent = nullptr;
+        }
+    }
     LogInfo(L"AudioService started");
 }
 
@@ -5719,7 +6058,12 @@ void AudioService::ResetLoopback() {
     if (m_audioClient) m_audioClient->Stop();
     m_captureClient.Reset();
     m_audioClient.Reset();
+    if (m_audioSamplesReadyEvent) {
+        m_audioSamplesReadyEvent.reset();
+    }
     m_deviceEnumerator.Reset();
+    m_loopbackDeviceId.clear();
+    m_lastLoopbackDeviceCheckTick = 0;
     if (m_pwfx) {
         CoTaskMemFree(m_pwfx);
         m_pwfx = nullptr;
@@ -5727,12 +6071,66 @@ void AudioService::ResetLoopback() {
     m_isLoopbackActive = false;
     for (auto& filter : m_eqFilters) filter = BiquadBand{};
     m_eqFilterSampleRate = 0.0f;
-    for (float& value : m_bandSmooth) value = 0.0f;
+    for (auto& value : m_bandSmooth) value.store(0.0f, std::memory_order_relaxed);
+}
+
+DWORD WINAPI AudioService::LoopbackThreadProcStatic(LPVOID param) {
+    auto* self = static_cast<AudioService*>(param);
+    if (self) self->LoopbackThreadProc();
+    return 0;
+}
+
+void AudioService::LoopbackThreadProc() {
+    const HRESULT initHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(initHr)) {
+        LogError(L"Audio loopback worker COM initialization failed (HRESULT=0x%08X)",
+                 static_cast<unsigned>(initHr));
+        return;
+    }
+
+    while (m_isRunning.load(std::memory_order_acquire)) {
+        try {
+            if (m_loopbackRequested.load(std::memory_order_acquire)) {
+                UpdateLoopback();
+                if (m_audioSamplesReadyEvent && m_loopbackWakeEvent) {
+                    HANDLE waits[] = { m_audioSamplesReadyEvent, m_loopbackWakeEvent };
+                    WaitForMultipleObjects(_countof(waits), waits, FALSE, 100);
+                } else if (m_loopbackWakeEvent) {
+                    WaitForSingleObject(m_loopbackWakeEvent, 20);
+                } else {
+                    Sleep(20);
+                }
+            } else {
+                ResetLoopback();
+                if (m_loopbackWakeEvent) WaitForSingleObject(m_loopbackWakeEvent, INFINITE);
+                else Sleep(50);
+            }
+        } catch (const std::exception& e) {
+            LogError(L"Audio loopback worker exception: %S", e.what());
+            ResetLoopback();
+            Sleep(100);
+        } catch (...) {
+            LogError(L"Audio loopback worker unknown exception");
+            ResetLoopback();
+            Sleep(100);
+        }
+    }
+
+    ResetLoopback();
+    CoUninitialize();
 }
 
 void AudioService::Stop() {
-    m_isRunning = false;
-    ResetLoopback();
+    if (!m_isRunning.exchange(false)) return;
+    m_loopbackRequested.store(false, std::memory_order_release);
+    if (m_loopbackWakeEvent) SetEvent(m_loopbackWakeEvent);
+    if (m_loopbackThread) {
+        WaitForSingleObject(m_loopbackThread, INFINITE);
+        m_loopbackThread.reset();
+    }
+    if (m_loopbackWakeEvent) {
+        m_loopbackWakeEvent.reset();
+    }
     m_endpointVolume.Reset();
     m_volumeDeviceEnumerator.Reset();
     m_volumeDeviceId.clear();
@@ -5872,7 +6270,8 @@ void AudioService::SetVolume(float volume) {
 }
 
 void AudioService::UpdateLoopback() {
-    if (!m_isRunning) return;
+    if (!m_isRunning.load(std::memory_order_acquire) ||
+        !m_loopbackRequested.load(std::memory_order_acquire)) return;
     
     if (!m_isLoopbackActive) {
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&m_deviceEnumerator));
@@ -5881,14 +6280,30 @@ void AudioService::UpdateLoopback() {
         ComPtr<IMMDevice> defaultDevice;
         hr = m_deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice);
         if (FAILED(hr)) { ResetLoopback(); return; }
-        
+
+        LPWSTR rawLoopbackId = nullptr;
+        hr = defaultDevice->GetId(&rawLoopbackId);
+        if (FAILED(hr) || !rawLoopbackId) { ResetLoopback(); return; }
+        m_loopbackDeviceId = rawLoopbackId;
+        CoTaskMemFree(rawLoopbackId);
+        m_lastLoopbackDeviceCheckTick = GetTickCount64();
+
+        m_audioSamplesReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!m_audioSamplesReadyEvent) { ResetLoopback(); return; }
+
         hr = defaultDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(m_audioClient.GetAddressOf()));
         if (FAILED(hr)) { ResetLoopback(); return; }
 
         hr = m_audioClient->GetMixFormat(&m_pwfx);
         if (FAILED(hr) || !m_pwfx) { ResetLoopback(); return; }
 
-        hr = m_audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1000000, 0, m_pwfx, nullptr);
+        hr = m_audioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            1000000, 0, m_pwfx, nullptr);
+        if (FAILED(hr)) { ResetLoopback(); return; }
+
+        hr = m_audioClient->SetEventHandle(m_audioSamplesReadyEvent);
         if (FAILED(hr)) { ResetLoopback(); return; }
 
         hr = m_audioClient->GetService(IID_PPV_ARGS(&m_captureClient));
@@ -5901,6 +6316,32 @@ void AudioService::UpdateLoopback() {
     }
     
     if (m_isLoopbackActive && m_captureClient) {
+        const ULONGLONG now = GetTickCount64();
+        if (m_lastLoopbackDeviceCheckTick == 0 ||
+            now - m_lastLoopbackDeviceCheckTick >= 2000) {
+            m_lastLoopbackDeviceCheckTick = now;
+            ComPtr<IMMDevice> currentDefaultDevice;
+            HRESULT deviceHr = m_deviceEnumerator->GetDefaultAudioEndpoint(
+                eRender, eConsole, &currentDefaultDevice);
+            if (FAILED(deviceHr) || !currentDefaultDevice) {
+                ResetLoopback();
+                return;
+            }
+            LPWSTR currentIdRaw = nullptr;
+            deviceHr = currentDefaultDevice->GetId(&currentIdRaw);
+            if (FAILED(deviceHr) || !currentIdRaw) {
+                ResetLoopback();
+                return;
+            }
+            const std::wstring currentId(currentIdRaw);
+            CoTaskMemFree(currentIdRaw);
+            if (currentId != m_loopbackDeviceId) {
+                LogInfo(L"Default audio output changed; restarting loopback capture");
+                ResetLoopback();
+                return;
+            }
+        }
+
         UINT32 packetLength = 0;
         float maxBands[6]{};
         
@@ -6025,18 +6466,24 @@ void AudioService::UpdateLoopback() {
         for (int band = 0; band < 6; ++band) {
             const float value = Utils::Clamp(maxBands[band], 0.0f, 1.0f);
             // Audio-thread envelope: fast attack and smooth release per band.
-            if (value > m_bandSmooth[band])
-                m_bandSmooth[band] += 0.70f * (value - m_bandSmooth[band]);
-            else
-                m_bandSmooth[band] *= 0.82f;
+            const float previous = m_bandSmooth[band].load(std::memory_order_relaxed);
+            const float smoothed = (value > previous)
+                ? previous + 0.70f * (value - previous)
+                : previous * 0.82f;
+            m_bandSmooth[band].store(smoothed, std::memory_order_relaxed);
         }
     }
 }
 
-void AudioService::StopLoopbackCapture() {
-    if (m_isLoopbackActive || m_audioClient || m_captureClient) {
-        ResetLoopback();
+void AudioService::SetLoopbackCaptureEnabled(bool enabled) {
+    const bool previous = m_loopbackRequested.exchange(enabled, std::memory_order_acq_rel);
+    if (previous != enabled && m_loopbackWakeEvent) {
+        SetEvent(m_loopbackWakeEvent);
     }
+}
+
+void AudioService::StopLoopbackCapture() {
+    SetLoopbackCaptureEnabled(false);
 }
 
 void AudioService::CheckMicUsage() {
@@ -6058,74 +6505,67 @@ void AudioService::CheckMicUsage() {
     if (m_lastMicPollTick != 0 && micNow - m_lastMicPollTick < 1000) return;
     m_lastMicPollTick = micNow;
     
-    static const wchar_t* REG_PATHS[] = {
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone\\NonPackaged",
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone"
-    };
-    
     bool currentlyInUse = false;
-    std::wstring activeAppName = L"";
-    
-    for (const auto* regPath : REG_PATHS) {
-        HKEY hKey = nullptr;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, regPath, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            DWORD subKeyCount = 0;
-            DWORD maxSubKeyLen = 0;
-            
-            if (RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, &subKeyCount, &maxSubKeyLen, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-                std::vector<wchar_t> keyNameBuf(maxSubKeyLen + 2);
-                
-                for (DWORD i = 0; i < subKeyCount; ++i) {
-                    DWORD keyNameLen = static_cast<DWORD>(keyNameBuf.size());
-                    
-                    if (RegEnumKeyExW(hKey, i, keyNameBuf.data(), &keyNameLen, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-                        HKEY hSubKey = nullptr;
-                        if (RegOpenKeyExW(hKey, keyNameBuf.data(), 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
-                            uint64_t stopTime = 0;
-                            DWORD dataSize = sizeof(stopTime);
-                            DWORD type = 0;
-                            
-                            if (RegQueryValueExW(hSubKey, L"LastUsedTimeStop", nullptr, &type, reinterpret_cast<LPBYTE>(&stopTime), &dataSize) == ERROR_SUCCESS) {
-                                if (stopTime == 0) {
-                                    currentlyInUse = true;
-                                    
-                                    std::wstring nameStr(keyNameBuf.data(), keyNameLen);
-                                    size_t lastSep = nameStr.find_last_of(L"#/\\");
-                                    
-                                    if (lastSep != std::wstring::npos && lastSep + 1 < nameStr.length()) {
-                                        activeAppName = nameStr.substr(lastSep + 1);
-                                    } else {
-                                        activeAppName = nameStr;
-                                    }
-                                    
-                                    size_t exePos = activeAppName.find(L".exe");
-                                    if (exePos != std::wstring::npos) {
-                                        activeAppName = activeAppName.substr(0, exePos);
-                                    }
-                                    
-                                    size_t dotPos = activeAppName.find(L'.');
-                                    size_t underPos = activeAppName.rfind(L'_');
-                                    
-                                    if (dotPos != std::wstring::npos && underPos != std::wstring::npos && underPos > dotPos) {
-                                        activeAppName = activeAppName.substr(dotPos + 1, underPos - dotPos - 1);
-                                    }
-                                }
-                            }
-                            
-                            RegCloseKey(hSubKey);
-                            
-                            if (currentlyInUse) break;
+    std::wstring activeAppName;
+
+    // Enumerate active sessions on the default capture endpoint instead of
+    // relying on undocumented-ish registry bookkeeping timestamps.
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                  IID_PPV_ARGS(&enumerator));
+    if (SUCCEEDED(hr) && enumerator) {
+        ComPtr<IMMDeviceCollection> captureDevices;
+        hr = enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &captureDevices);
+        UINT endpointCount = 0;
+        if (SUCCEEDED(hr) && captureDevices && SUCCEEDED(captureDevices->GetCount(&endpointCount))) {
+            for (UINT endpointIndex = 0; endpointIndex < endpointCount && !currentlyInUse; ++endpointIndex) {
+                ComPtr<IMMDevice> captureDevice;
+                if (FAILED(captureDevices->Item(endpointIndex, &captureDevice)) || !captureDevice) continue;
+
+                ComPtr<IAudioSessionManager2> sessionManager;
+                hr = captureDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                                             nullptr, reinterpret_cast<void**>(sessionManager.GetAddressOf()));
+                if (FAILED(hr) || !sessionManager) continue;
+
+                ComPtr<IAudioSessionEnumerator> sessions;
+                hr = sessionManager->GetSessionEnumerator(&sessions);
+                if (FAILED(hr) || !sessions) continue;
+
+                int sessionCount = 0;
+                if (FAILED(sessions->GetCount(&sessionCount))) continue;
+                for (int i = 0; i < sessionCount; ++i) {
+                    ComPtr<IAudioSessionControl> control;
+                    if (FAILED(sessions->GetSession(i, &control)) || !control) continue;
+
+                    AudioSessionState state = AudioSessionStateInactive;
+                    if (FAILED(control->GetState(&state)) || state != AudioSessionStateActive) continue;
+
+                    ComPtr<IAudioSessionControl2> control2;
+                    DWORD processId = 0;
+                    if (SUCCEEDED(control.As(&control2)) && control2) {
+                        control2->GetProcessId(&processId);
+                    }
+
+                    LPWSTR displayName = nullptr;
+                    if (SUCCEEDED(control->GetDisplayName(&displayName)) && displayName) {
+                        activeAppName = displayName;
+                        CoTaskMemFree(displayName);
+                    }
+                    if (activeAppName.empty()) {
+                        if (processId) {
+                            activeAppName = L"Application (PID " +
+                                std::to_wstring(processId) + L")";
+                        } else {
+                            activeAppName = L"An application";
                         }
                     }
+                    currentlyInUse = true;
+                    break;
                 }
             }
         }
-        
-        if (hKey) RegCloseKey(hKey);
-
-        if (currentlyInUse) break;
     }
-    
+
     const bool changed = (currentlyInUse != m_isMicInUse) ||
                          (currentlyInUse && activeAppName != m_lastMicApp);
     m_isMicInUse = currentlyInUse;
@@ -6316,17 +6756,138 @@ void BluetoothService::Start() {
     if (m_isRunning) return;
     m_isRunning = true;
     m_lastPollTick = 0;
+    m_baselineDone = false;
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_DEVICE_WATCHER)
+    StartDeviceWatcher();
+#endif
     LogInfo(L"BluetoothService started");
 }
 
 void BluetoothService::Stop() {
     m_isRunning = false;
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_DEVICE_WATCHER)
+    StopDeviceWatcher();
+#endif
     m_knownConnected.clear();
     m_baselineDone = false;
 }
 
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_DEVICE_WATCHER)
+void BluetoothService::StartDeviceWatcher() {
+    try {
+        using namespace winrt::Windows::Devices::Enumeration;
+        // A paired-device selector combined with the AEP connection property
+        // distinguishes an actually connected peripheral from a merely present
+        // Bluetooth PnP node. SetupAPI remains the compatibility fallback.
+        const winrt::hstring selector =
+            L"System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\"";
+        std::vector<winrt::hstring> requestedProperties{ L"System.Devices.Aep.IsConnected" };
+        m_deviceWatcher = DeviceInformation::CreateWatcher(
+            selector, requestedProperties, DeviceInformationKind::AssociationEndpoint);
+        m_watcherConnected.clear();
+        m_watcherBaselineDone = false;
+
+        m_watcherAddedToken = m_deviceWatcher.Added([this](const DeviceWatcher&, const DeviceInformation& info) noexcept {
+            try { OnWatcherDevice(info, false); }
+            catch (const winrt::hresult_error& e) {
+                LogError(L"Bluetooth DeviceWatcher Added callback failed (HRESULT=0x%08X)", static_cast<unsigned>(e.code()));
+            } catch (...) { LogError(L"Bluetooth DeviceWatcher Added callback failed"); }
+        });
+        m_watcherUpdatedToken = m_deviceWatcher.Updated([this](const DeviceWatcher&, const DeviceInformationUpdate& update) noexcept {
+            try {
+                auto info = DeviceInformation::CreateFromIdAsync(update.Id()).get();
+                OnWatcherDevice(info, true);
+            } catch (const winrt::hresult_error& e) {
+                LogError(L"Bluetooth DeviceWatcher Updated callback failed (HRESULT=0x%08X)", static_cast<unsigned>(e.code()));
+            } catch (...) { LogError(L"Bluetooth DeviceWatcher Updated callback failed"); }
+        });
+        m_watcherRemovedToken = m_deviceWatcher.Removed([this](const DeviceWatcher&, const DeviceInformationUpdate& update) noexcept {
+            std::lock_guard<std::mutex> lock(m_watcherMutex);
+            m_watcherConnected.erase(update.Id().c_str());
+        });
+        m_watcherEnumerationToken = m_deviceWatcher.EnumerationCompleted([this](const DeviceWatcher&, const winrt::Windows::Foundation::IInspectable&) noexcept {
+            std::lock_guard<std::mutex> lock(m_watcherMutex);
+            m_watcherBaselineDone = true;
+        });
+        m_deviceWatcher.Start();
+        m_watcherActive = true;
+        LogInfo(L"Bluetooth DeviceWatcher started");
+    } catch (const winrt::hresult_error& e) {
+        m_watcherActive = false;
+        m_deviceWatcher = nullptr;
+        LogError(L"Bluetooth DeviceWatcher unavailable; using SetupAPI fallback (HRESULT=0x%08X): %s",
+                 static_cast<unsigned>(e.code()), e.message().c_str());
+    } catch (...) {
+        m_watcherActive = false;
+        m_deviceWatcher = nullptr;
+        LogError(L"Bluetooth DeviceWatcher unavailable; using SetupAPI fallback");
+    }
+}
+
+void BluetoothService::StopDeviceWatcher() {
+    if (!m_deviceWatcher) { m_watcherActive = false; return; }
+    try {
+        if (m_deviceWatcher.Status() == winrt::Windows::Devices::Enumeration::DeviceWatcherStatus::Started ||
+            m_deviceWatcher.Status() == winrt::Windows::Devices::Enumeration::DeviceWatcherStatus::EnumerationCompleted) {
+            m_deviceWatcher.Stop();
+        }
+        if (m_watcherAddedToken.value) m_deviceWatcher.Added(m_watcherAddedToken);
+        if (m_watcherUpdatedToken.value) m_deviceWatcher.Updated(m_watcherUpdatedToken);
+        if (m_watcherRemovedToken.value) m_deviceWatcher.Removed(m_watcherRemovedToken);
+        if (m_watcherEnumerationToken.value) m_deviceWatcher.EnumerationCompleted(m_watcherEnumerationToken);
+    } catch (...) { LogError(L"Bluetooth DeviceWatcher shutdown encountered an error"); }
+    m_watcherAddedToken = {};
+    m_watcherUpdatedToken = {};
+    m_watcherRemovedToken = {};
+    m_watcherEnumerationToken = {};
+    m_deviceWatcher = nullptr;
+    m_watcherActive = false;
+    std::lock_guard<std::mutex> lock(m_watcherMutex);
+    m_watcherConnected.clear();
+    m_watcherBaselineDone = false;
+}
+
+void BluetoothService::OnWatcherDevice(const winrt::Windows::Devices::Enumeration::DeviceInformation& info, bool) {
+    if (!m_isRunning || !m_manager || !info) return;
+    bool connected = false;
+    try {
+        auto properties = info.Properties();
+        auto value = properties.Lookup(L"System.Devices.Aep.IsConnected");
+        if (value) connected = winrt::unbox_value<bool>(value);
+    } catch (...) { return; }
+
+    const std::wstring id = info.Id().c_str();
+    const std::wstring name = info.Name().c_str();
+    if (id.empty() || name.empty()) return;
+
+    bool shouldNotify = false;
+    {
+        std::lock_guard<std::mutex> lock(m_watcherMutex);
+        const bool wasConnected = m_watcherConnected.find(id) != m_watcherConnected.end();
+        if (connected) {
+            if (!wasConnected && m_watcherBaselineDone) shouldNotify = true;
+            m_watcherConnected[id] = name;
+        } else {
+            m_watcherConnected.erase(id);
+        }
+    }
+
+    if (shouldNotify && GetSettingsSnapshot().enableBluetoothHUD) {
+        QueuedEvent event;
+        event.type = EventType::Bluetooth;
+        event.durationMs = DURATION_BLUETOOTH_MS;
+        event.title = name;
+        event.progressPercent = -1; // AEP watcher does not guarantee battery data.
+        m_manager->PostTransientEvent(event);
+    }
+}
+#endif
+
 void BluetoothService::Poll() {
     if (!m_isRunning || !m_manager || !GetSettingsSnapshot().enableBluetoothHUD) return;
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_DEVICE_WATCHER)
+    if (m_watcherActive) return;
+#endif
     const ULONGLONG now = GetTickCount64();
     if (m_lastPollTick != 0 && now - m_lastPollTick < 3000) return;
     m_lastPollTick = now;
@@ -6388,9 +6949,23 @@ void BluetoothService::Poll() {
             batteryLevel = static_cast<int>(batteryByte);
         }
 
-        nowConnected.insert(deviceName);
+        // Device display names are not unique. Track the PnP instance ID so
+        // two peripherals with identical friendly names remain independent.
+        std::wstring deviceKey;
+        DWORD requiredChars = 0;
+        SetupDiGetDeviceInstanceIdW(hDevInfo, &did, nullptr, 0, &requiredChars);
+        if (requiredChars > 1 && requiredChars < 4096) {
+            std::vector<wchar_t> instanceId(requiredChars + 1, L'\0');
+            if (SetupDiGetDeviceInstanceIdW(hDevInfo, &did, instanceId.data(),
+                                            static_cast<DWORD>(instanceId.size()), nullptr)) {
+                deviceKey.assign(instanceId.data());
+            }
+        }
+        if (deviceKey.empty()) deviceKey = deviceName;
 
-        if (m_knownConnected.find(deviceName) == m_knownConnected.end()) {
+        nowConnected.insert(deviceKey);
+
+        if (m_knownConnected.find(deviceKey) == m_knownConnected.end() && m_baselineDone) {
             QueuedEvent qe;
             qe.type = EventType::Bluetooth;
             qe.durationMs = DURATION_BLUETOOTH_MS;
@@ -6531,11 +7106,11 @@ static std::unique_ptr<Services::BluetoothService> g_bluetoothService;
 static std::unique_ptr<Services::TimerService> g_timerService;
 
 static UINT_PTR g_pollTimerId = 2001;
-static DWORD g_lastTimerTick = 0;
+static ULONGLONG g_lastTimerTick = 0;
 
-static HANDLE g_uiThread = nullptr;
+static UniqueWinHandle g_uiThread;
 static DWORD g_uiThreadId = 0;
-static HANDLE g_uiReadyEvent = nullptr;
+static UniqueWinHandle g_uiReadyEvent;
 static std::atomic<bool> g_uiStartupSucceeded{false};
 
 void LoadSettings() {
@@ -6574,6 +7149,7 @@ void LoadSettings() {
     }
     
     g_settings.enableMedia = Wh_GetIntSetting(L"enableMedia") != 0;
+    g_settings.enableOnlineArtworkLookup = Wh_GetIntSetting(L"enableOnlineArtworkLookup") != 0;
     g_settings.enableTimer = Wh_GetIntSetting(L"enableTimer") != 0;
     g_settings.enableMicStatus = Wh_GetIntSetting(L"enableMicStatus") != 0;
     g_settings.enableVolumeHUD = Wh_GetIntSetting(L"enableVolumeHUD") != 0;
@@ -6655,17 +7231,40 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
     }
 #endif
 
+#if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
+    struct UiApartmentScope {
+        ~UiApartmentScope() { winrt::uninit_apartment(); }
+    } uiApartmentScope;
+#else
+    struct UiApartmentScope {
+        ~UiApartmentScope() { CoUninitialize(); }
+    } uiApartmentScope;
+#endif
+
+    auto cleanupUiThread = []() {
+        if (g_islandWindow && g_islandWindow->GetHwnd()) {
+            KillTimer(g_islandWindow->GetHwnd(), g_pollTimerId);
+        }
+        g_timerService.reset();
+        g_bluetoothService.reset();
+        g_keyboardService.reset();
+        g_powerService.reset();
+        g_audioService.reset();
+        g_mediaService.reset();
+        g_serviceManager.reset();
+        if (g_islandWindow) {
+            g_islandWindow->Destroy();
+            g_islandWindow.reset();
+        }
+    };
+
+    try {
     g_islandWindow = std::make_unique<Overlay::IslandWindow>();
     if (!g_islandWindow->Create()) {
         LogError(L"Failed to create Dynamic Island overlay window");
         g_islandWindow->Destroy();
         g_islandWindow.reset();
         if (g_uiReadyEvent) SetEvent(g_uiReadyEvent);
-#if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
-        winrt::uninit_apartment();
-#else
-        CoUninitialize();
-#endif
         return 0;
     }
     
@@ -6689,7 +7288,7 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
     if (GetSettingsSnapshot().enableCapsLockHUD) g_keyboardService->Start();
     if (GetSettingsSnapshot().enableBluetoothHUD) g_bluetoothService->Start();
     
-    g_lastTimerTick = GetTickCount();
+    g_lastTimerTick = GetTickCount64();
     SetTimer(g_islandWindow->GetHwnd(), g_pollTimerId, 200, nullptr);
     
     if (GetSettingsSnapshot().idleVisibilityMode == IdleVisibilityMode::AlwaysVisible ||
@@ -6716,17 +7315,15 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
                 g_audioService->CheckMicUsage();
                 if (g_mediaService) {
                     const MediaState mediaSnapshot = g_mediaService->SnapshotState();
-                    if (!mediaSnapshot.title.empty() && mediaSnapshot.isPlaying) {
-                        g_audioService->UpdateLoopback();
-                    } else {
-                        g_audioService->StopLoopbackCapture();
-                    }
+                    g_audioService->SetLoopbackCaptureEnabled(
+                        !mediaSnapshot.title.empty() && mediaSnapshot.isPlaying);
+
                 } else {
                     g_audioService->StopLoopbackCapture();
                 }
             }
             
-            DWORD now = GetTickCount();
+            ULONGLONG now = GetTickCount64();
             if (now - g_lastTimerTick >= 200) {
                 g_lastTimerTick = now;
                 if (GetSettingsSnapshot().enableTimer && g_timerService) g_timerService->Tick();
@@ -6781,28 +7378,21 @@ static DWORD WINAPI IslandUIThreadProc(LPVOID) {
     if (messageResult == -1) {
         LogError(L"GetMessageW failed (error=%lu)", GetLastError());
     }
-    if (g_islandWindow && g_islandWindow->GetHwnd()) {
-        KillTimer(g_islandWindow->GetHwnd(), g_pollTimerId);
+    cleanupUiThread();
+    return 0;
+    } catch (const std::exception& e) {
+        LogError(L"Unhandled C++ exception in UI thread: %S", e.what());
+    } catch (...) {
+        LogError(L"Unhandled unknown exception in UI thread");
     }
-    
-    g_timerService.reset();
-    g_bluetoothService.reset();
-    g_keyboardService.reset();
-    g_powerService.reset();
-    g_audioService.reset();
-    g_mediaService.reset();
-    g_serviceManager.reset();
-    
-    if (g_islandWindow) {
-        g_islandWindow->Destroy();
-        g_islandWindow.reset();
+
+    g_uiStartupSucceeded.store(false);
+    if (g_uiReadyEvent) SetEvent(g_uiReadyEvent);
+    try {
+        cleanupUiThread();
+    } catch (...) {
+        LogError(L"Exception while cleaning up UI thread state");
     }
-    
-#if defined(DYNAMIC_ISLAND_HAS_WINRT_GSMTC)
-    winrt::uninit_apartment();
-#else
-    CoUninitialize();
-#endif
     return 0;
 }
 } // namespace DynamicIsland
@@ -6871,24 +7461,21 @@ BOOL Wh_ModInit() {
     if (!DynamicIsland::g_uiThread) {
         DynamicIsland::LogError(L"Failed to create Dynamic Island UI thread");
         if (DynamicIsland::g_uiReadyEvent) {
-            CloseHandle(DynamicIsland::g_uiReadyEvent);
-            DynamicIsland::g_uiReadyEvent = nullptr;
+            DynamicIsland::g_uiReadyEvent.reset();
         }
         DynamicIsland::CleanupHighPrecisionTimer();
         return FALSE;
     }
     
     const DWORD readyWait = WaitForSingleObject(DynamicIsland::g_uiReadyEvent, INFINITE);
-    CloseHandle(DynamicIsland::g_uiReadyEvent);
-    DynamicIsland::g_uiReadyEvent = nullptr;
+    DynamicIsland::g_uiReadyEvent.reset();
     if (readyWait != WAIT_OBJECT_0 || !DynamicIsland::g_uiStartupSucceeded.load()) {
         DynamicIsland::LogError(L"UI thread failed to initialize");
         if (DynamicIsland::g_uiThreadId != 0) {
             PostThreadMessageW(DynamicIsland::g_uiThreadId, WM_QUIT, 0, 0);
         }
         WaitForSingleObject(DynamicIsland::g_uiThread, INFINITE);
-        CloseHandle(DynamicIsland::g_uiThread);
-        DynamicIsland::g_uiThread = nullptr;
+        DynamicIsland::g_uiThread.reset();
         DynamicIsland::g_uiThreadId = 0;
         DynamicIsland::CleanupHighPrecisionTimer();
         return FALSE;
@@ -6908,8 +7495,7 @@ void Wh_ModUninit() {
         }
         // Do not release module-owned state while its UI thread is still running.
         WaitForSingleObject(DynamicIsland::g_uiThread, INFINITE);
-        CloseHandle(DynamicIsland::g_uiThread);
-        DynamicIsland::g_uiThread = nullptr;
+        DynamicIsland::g_uiThread.reset();
     }
     
     DynamicIsland::CleanupHighPrecisionTimer();
