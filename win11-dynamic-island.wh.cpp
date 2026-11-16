@@ -507,7 +507,15 @@ public:
     bool HasAlbumArtBitmap() const { return m_albumArtBitmap != nullptr; }
     void DrawIconImage(IconType type, const D2D1_RECT_F& bounds, D2D1_COLOR_F color);
     void DrawButtonPill(const D2D1_RECT_F& bounds, const std::wstring& text, bool isHovered);
-    void DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, bool isHovered, float iconScale = 1.0f);
+    void DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, float iconScale = 1.0f, float hoverProgress = 0.0f);
+    void DrawCircularButtonTransition(
+        const D2D1_RECT_F& bounds,
+        IconType fromIcon,
+        IconType toIcon,
+        float transitionProgress,
+        float iconScale = 1.0f,
+        float hoverProgress = 0.0f
+    );
     
     ID2D1RenderTarget* GetRenderTarget() const { return m_dcRenderTarget.Get(); }
 
@@ -610,6 +618,27 @@ public:
     void SetServiceManager(Services::ServiceManager* sm) { m_serviceManager = sm; }
     
     void UpdateMediaState(const MediaState& state) {
+        // Animate only real play/pause changes after a track is already active.
+        // The outgoing glyph shrinks into the center before the incoming glyph grows out.
+        if (!m_mediaState.title.empty() && m_mediaState.isPlaying != state.isPlaying) {
+            m_playbackIconFrom = m_mediaState.isPlaying ? Graphics::IconType::Pause : Graphics::IconType::Play;
+            m_playbackIconTo = state.isPlaying ? Graphics::IconType::Pause : Graphics::IconType::Play;
+            m_playbackIconTransitionStartMs = Graphics::GetHighPrecisionTimeMs();
+            m_playbackIconTransitionProgress = 0.0f;
+            m_playbackIconTransitionActive = true;
+            if (m_hwnd && m_state != IslandState::Hidden) {
+                SetTimer(m_hwnd, m_animTimerId, 8, nullptr);
+            }
+        } else if (!m_playbackIconTransitionActive) {
+            // Keep the icon correct on first load and whenever no transition is running.
+            const Graphics::IconType currentIcon = state.isPlaying
+                ? Graphics::IconType::Pause
+                : Graphics::IconType::Play;
+            m_playbackIconFrom = currentIcon;
+            m_playbackIconTo = currentIcon;
+            m_playbackIconTransitionProgress = 1.0f;
+        }
+
         // Ignore external position updates while the user is dragging the progress bar.
         if (m_isSeeking) {
             // Still allow title/artist/play-state changes (e.g. track switch mid-seek).
@@ -655,6 +684,7 @@ public:
     TransientState& GetTransientState() { return m_transientState; }
     
     void TriggerAnimationUpdate();
+    void UpdateMediaButtonHover(float localX, float localY);
     void Render();
     void UpdateDimensions();
     void OnTaskbarOrDisplayChanged();
@@ -688,6 +718,17 @@ private:
     Graphics::AnimatedValue m_animOpacity{0.0f};
     Graphics::AnimatedValue m_crossfadeAlpha{1.0f};
     Graphics::AnimatedValue m_animScale{1.0f};
+    // Independent hover animations for Previous, Play/Pause, and Next.
+    Graphics::AnimatedValue m_prevButtonHover{0.0f};
+    Graphics::AnimatedValue m_playButtonHover{0.0f};
+    Graphics::AnimatedValue m_nextButtonHover{0.0f};
+    // Separate play/pause glyph transition: outgoing icon contracts, then incoming expands.
+    Graphics::IconType m_playbackIconFrom = Graphics::IconType::Play;
+    Graphics::IconType m_playbackIconTo = Graphics::IconType::Play;
+    float m_playbackIconTransitionProgress = 1.0f;
+    double m_playbackIconTransitionStartMs = 0.0;
+    bool m_playbackIconTransitionActive = false;
+    int m_hoveredMediaButton = -1; // -1 none, 0 previous, 1 play/pause, 2 next
     
     EventType m_prevEvent = EventType::None;
     TransientState m_prevTransientState;
@@ -2742,7 +2783,7 @@ void D2DRenderer::DrawButtonPill(const D2D1_RECT_F& bounds, const std::wstring& 
     }
 }
 
-void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, bool isHovered, float iconScale) {
+void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, float iconScale, float hoverProgress) {
     if (!m_dcRenderTarget || !m_solidBrush) return;
     
     float w = bounds.right - bounds.left;
@@ -2751,12 +2792,14 @@ void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, b
     D2D1_POINT_2F center = D2D1::Point2F(bounds.left + w / 2.0f, bounds.top + h / 2.0f);
     float radius = (w < h ? w : h) / 2.0f;
     
-    if (isHovered) {
-        m_solidBrush->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f));
+    hoverProgress = Utils::Clamp(hoverProgress, 0.0f, 1.0f);
+    if (hoverProgress > 0.001f) {
+        m_solidBrush->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f * hoverProgress));
         m_dcRenderTarget->FillEllipse(D2D1::Ellipse(center, radius, radius), m_solidBrush.Get());
     }
     
-    float iconSize = 22.0f * iconScale;
+    // A small scale-up accompanies the fading highlight on hover.
+    float iconSize = 22.0f * iconScale * (1.0f + 0.045f * hoverProgress);
     D2D1_RECT_F iconBounds = D2D1::RectF(
         center.x - iconSize / 2.0f,
         center.y - iconSize / 2.0f,
@@ -2765,6 +2808,60 @@ void D2DRenderer::DrawCircularButton(const D2D1_RECT_F& bounds, IconType icon, b
     );
     
     DrawIconImage(icon, iconBounds, D2D1::ColorF(D2D1::ColorF::White));
+}
+
+void D2DRenderer::DrawCircularButtonTransition(
+    const D2D1_RECT_F& bounds,
+    IconType fromIcon,
+    IconType toIcon,
+    float transitionProgress,
+    float iconScale,
+    float hoverProgress
+) {
+    if (!m_dcRenderTarget || !m_solidBrush) return;
+
+    const float w = bounds.right - bounds.left;
+    const float h = bounds.bottom - bounds.top;
+    const D2D1_POINT_2F center = D2D1::Point2F(bounds.left + w / 2.0f, bounds.top + h / 2.0f);
+    const float radius = (w < h ? w : h) / 2.0f;
+
+    hoverProgress = Utils::Clamp(hoverProgress, 0.0f, 1.0f);
+    if (hoverProgress > 0.001f) {
+        m_solidBrush->SetColor(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f * hoverProgress));
+        m_dcRenderTarget->FillEllipse(D2D1::Ellipse(center, radius, radius), m_solidBrush.Get());
+    }
+
+    const float baseIconSize = 22.0f * iconScale * (1.0f + 0.045f * hoverProgress);
+    const float progress = Utils::Clamp(transitionProgress, 0.0f, 1.0f);
+    auto drawScaledGlyph = [&](IconType icon, float scale, float alpha) {
+        if (alpha <= 0.001f || scale <= 0.001f) return;
+        const float iconSize = baseIconSize * scale;
+        const D2D1_RECT_F iconBounds = D2D1::RectF(
+            center.x - iconSize / 2.0f,
+            center.y - iconSize / 2.0f,
+            center.x + iconSize / 2.0f,
+            center.y + iconSize / 2.0f
+        );
+        DrawIconImage(icon, iconBounds, D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha));
+    };
+    auto smoothStep = [](float value) {
+        value = Utils::Clamp(value, 0.0f, 1.0f);
+        return value * value * (3.0f - 2.0f * value);
+    };
+
+    // Keep the two phases distinct: the current glyph contracts into the
+    // center first; the replacement then emerges from that same center.
+    constexpr float kShrinkEnd = 0.46f;
+    constexpr float kGrowStart = 0.54f;
+    if (progress >= 1.0f) {
+        drawScaledGlyph(toIcon, 1.0f, 1.0f);
+    } else if (progress < kShrinkEnd) {
+        const float phase = smoothStep(progress / kShrinkEnd);
+        drawScaledGlyph(fromIcon, 1.0f - 0.84f * phase, 1.0f - phase);
+    } else if (progress >= kGrowStart) {
+        const float phase = smoothStep((progress - kGrowStart) / (1.0f - kGrowStart));
+        drawScaledGlyph(toIcon, 0.16f + 0.84f * phase, phase);
+    }
 }
 } // namespace Graphics
 } // namespace DynamicIsland
@@ -2820,7 +2917,7 @@ IslandMetrics LayoutEngine::CalculateMetrics(
         switch (eventType) {
             case EventType::Media:      defaultWidth = 191.0f; break; // Compact media player: 5 px narrower
             case EventType::Timer:      defaultWidth = 176.0f; break;
-            case EventType::MicStatus:  defaultWidth = 176.0f; break;
+            case EventType::MicStatus:  defaultWidth = 48.0f; break;
             case EventType::Volume:     defaultWidth = 206.0f; break;
             case EventType::CapsLock:   defaultWidth = 160.0f; break;
             case EventType::Power:      defaultWidth = 196.0f; break;
@@ -2849,8 +2946,9 @@ IslandMetrics LayoutEngine::CalculateMetrics(
                 expHeight = 124.0f;
                 break;
             case EventType::MicStatus:
-                expWidth = 280.0f;
-                expHeight = 78.0f;
+                // Dot-only privacy indicator; width accounts for the 5 px global trim.
+                expWidth = 69.0f;
+                expHeight = 64.0f;
                 break;
             default:
                 expWidth = 280.0f;
@@ -2860,7 +2958,7 @@ IslandMetrics LayoutEngine::CalculateMetrics(
         
         m.width = Utils::ScaleDpiF(expWidth, dpi);
         m.height = Utils::ScaleDpiF(expHeight, dpi);
-        m.cornerRadius = Utils::ScaleDpiF(26.0f, dpi);
+        m.cornerRadius = Utils::ScaleDpiF(eventType == EventType::MicStatus ? 32.0f : 26.0f, dpi);
     }
     
     // Slightly shorten the island by 5 DPI-scaled pixels while preserving its height.
@@ -3225,6 +3323,36 @@ void IslandWindow::UpdateDimensions() {
     }
 }
 
+void IslandWindow::UpdateMediaButtonHover(float localX, float localY) {
+    int hoveredButton = -1;
+
+    if (m_state == IslandState::Expanded && m_currentEvent == EventType::Media) {
+        const float midX = m_animWidth.GetValue() / 2.0f;
+        if (localY >= 98.0f && localY <= 136.0f) {
+            if (localX >= midX - 60.0f && localX <= midX - 26.0f) {
+                hoveredButton = 0;
+            } else if (localX >= midX - 22.0f && localX <= midX + 22.0f) {
+                hoveredButton = 1;
+            } else if (localX >= midX + 26.0f && localX <= midX + 60.0f) {
+                hoveredButton = 2;
+            }
+        }
+    }
+
+    if (hoveredButton == m_hoveredMediaButton) {
+        return;
+    }
+
+    m_hoveredMediaButton = hoveredButton;
+    m_prevButtonHover.SetTarget(hoveredButton == 0 ? 1.0f : 0.0f, 150.0);
+    m_playButtonHover.SetTarget(hoveredButton == 1 ? 1.0f : 0.0f, 150.0);
+    m_nextButtonHover.SetTarget(hoveredButton == 2 ? 1.0f : 0.0f, 150.0);
+
+    if (m_hwnd && m_state != IslandState::Hidden) {
+        SetTimer(m_hwnd, m_animTimerId, 8, nullptr);
+    }
+}
+
 void IslandWindow::TriggerAnimationUpdate() {
     double now = Graphics::GetHighPrecisionTimeMs();
     
@@ -3234,6 +3362,20 @@ void IslandWindow::TriggerAnimationUpdate() {
     m_animOpacity.Update(now);
     m_crossfadeAlpha.Update(now);
     m_animScale.Update(now);
+    m_prevButtonHover.Update(now);
+    m_playButtonHover.Update(now);
+    m_nextButtonHover.Update(now);
+
+    if (m_playbackIconTransitionActive) {
+        constexpr double kPlaybackIconTransitionDurationMs = 280.0;
+        const double elapsed = now - m_playbackIconTransitionStartMs;
+        const float rawProgress = static_cast<float>(elapsed / kPlaybackIconTransitionDurationMs);
+        m_playbackIconTransitionProgress = Utils::Clamp(rawProgress, 0.0f, 1.0f);
+        if (rawProgress >= 1.0f) {
+            m_playbackIconTransitionProgress = 1.0f;
+            m_playbackIconTransitionActive = false;
+        }
+    }
     
     float curW = m_animWidth.GetValue();
     float curH = m_animHeight.GetValue();
@@ -3270,7 +3412,9 @@ void IslandWindow::TriggerAnimationUpdate() {
     
     if (!m_animWidth.IsAnimating() && !m_animHeight.IsAnimating() &&
         !m_animRadius.IsAnimating() && !m_animOpacity.IsAnimating() &&
-        !m_crossfadeAlpha.IsAnimating() && !m_animScale.IsAnimating()) {
+        !m_crossfadeAlpha.IsAnimating() && !m_animScale.IsAnimating() &&
+        !m_prevButtonHover.IsAnimating() && !m_playButtonHover.IsAnimating() &&
+        !m_nextButtonHover.IsAnimating() && !m_playbackIconTransitionActive) {
         KillTimer(m_hwnd, m_animTimerId);
         if (m_state == IslandState::Hidden) {
             KillTimer(m_hwnd, m_waveTimerId);
@@ -3571,17 +3715,11 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::MicStatus: {
+            // The active microphone indicator is intentionally dot-only.
             m_renderer->DrawStatusDot(
-                D2D1::Point2F(19.0f, h / 2.0f),
+                D2D1::Point2F(w / 2.0f, h / 2.0f),
                 4.0f,
                 D2D1::ColorF(1.0f, 0.624f, 0.039f, alpha)
-            );
-            m_renderer->DrawTextString(
-                L"Microphone active",
-                D2D1::RectF(32.0f, (h - 16.0f) / 2.0f, w - 10.0f, (h + 16.0f) / 2.0f),
-                D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha),
-                12.0f,
-                false
             );
             break;
         }
@@ -3811,7 +3949,7 @@ void IslandWindow::Render() {
             switch (m_currentEvent) {
                 case EventType::Media: {
                     D2D1_RECT_F artRect = D2D1::RectF(16.0f, 16.0f, 68.0f, 68.0f);
-                    m_renderer->DrawAlbumArt(artRect, 20.0f, 0.0f);
+                    m_renderer->DrawAlbumArt(artRect, 16.0f, 0.0f);
                     
                     m_renderer->DrawMarqueeText(
                         m_mediaState.title,
@@ -3895,25 +4033,27 @@ void IslandWindow::Render() {
                         false
                     );
                     
-                    // Playback controls: wider spread, the center button larger.
+                    // Playback controls: each icon gets its own smooth hover animation.
                     float midX = w / 2.0f;
                     m_renderer->DrawCircularButton(
                         D2D1::RectF(midX - 58.0f, 100.0f, midX - 30.0f, 132.0f),
                         Graphics::IconType::Previous,
-                        false,
-                        1.12f
+                        1.12f,
+                        m_prevButtonHover.GetValue()
                     );
-                    m_renderer->DrawCircularButton(
+                    m_renderer->DrawCircularButtonTransition(
                         D2D1::RectF(midX - 16.0f, 98.0f, midX + 16.0f, 134.0f),
-                        m_mediaState.isPlaying ? Graphics::IconType::Pause : Graphics::IconType::Play,
-                        false,
-                        1.18f
+                        m_playbackIconFrom,
+                        m_playbackIconTo,
+                        m_playbackIconTransitionProgress,
+                        1.40f,
+                        m_playButtonHover.GetValue()
                     );
                     m_renderer->DrawCircularButton(
                         D2D1::RectF(midX + 30.0f, 100.0f, midX + 58.0f, 132.0f),
                         Graphics::IconType::Next,
-                        false,
-                        1.12f
+                        1.12f,
+                        m_nextButtonHover.GetValue()
                     );
                     break;
                 }
@@ -3958,26 +4098,11 @@ void IslandWindow::Render() {
                     break;
                 }
                 case EventType::MicStatus: {
+                    // Keep the expanded microphone indicator dot-only as well.
                     m_renderer->DrawStatusDot(
-                        D2D1::Point2F(28.0f, 39.0f),
+                        D2D1::Point2F(w / 2.0f, h / 2.0f),
                         5.0f,
                         D2D1::ColorF(1.0f, 0.624f, 0.039f, 1.0f)
-                    );
-                    
-                    m_renderer->DrawTextString(
-                        m_micState.title,
-                        D2D1::RectF(46.0f, 20.0f, w - 16.0f, 40.0f),
-                        D2D1::ColorF(D2D1::ColorF::White),
-                        14.0f,
-                        true
-                    );
-                    
-                    m_renderer->DrawTextString(
-                        m_micState.appName,
-                        D2D1::RectF(46.0f, 42.0f, w - 16.0f, 62.0f),
-                        D2D1::ColorF(0.66f, 0.67f, 0.71f, 1.0f),
-                        12.0f,
-                        false
                     );
                     break;
                 }
@@ -4113,8 +4238,12 @@ LRESULT CALLBACK IslandWindow::WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, L
                 self->DisarmAutoCollapse();
             }
             
+            const float pointerLocalX = static_cast<float>(GET_X_LPARAM(lParam)) - self->m_currentPillX;
+            const float pointerLocalY = static_cast<float>(GET_Y_LPARAM(lParam)) - self->m_currentPillY;
+            self->UpdateMediaButtonHover(pointerLocalX, pointerLocalY);
+
             if (self->m_isSeeking) {
-                const float localX = static_cast<float>(GET_X_LPARAM(lParam)) - self->m_currentPillX;
+                const float localX = pointerLocalX;
                 const float w = self->m_animWidth.GetValue();
                 self->UpdateSeekFromLocalX(localX, w);
             }
@@ -4129,6 +4258,7 @@ LRESULT CALLBACK IslandWindow::WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, L
         
         case WM_MOUSELEAVE:
             self->m_isHovered = false;
+            self->UpdateMediaButtonHover(-1.0f, -1.0f);
             if (self->m_isSeeking) {
                 self->EndSeek(true);
             } else if (self->m_state == IslandState::Expanded) {
@@ -6441,8 +6571,8 @@ void AudioService::UpdateLoopback() {
                         }
 
                         if (n > 0) {
-                            // Conservative gain keeps the six independent bands below the visual ceiling.
-                            constexpr float kEqualizerGain = 4.5f;
+                            // Higher gain makes quieter audio move the six bands more visibly.
+                            constexpr float kEqualizerGain = 7.0f;
                             for (int band = 0; band < 6; ++band) {
                                 const float rms = std::sqrt(sumSquares[band] / static_cast<float>(n)) * kEqualizerGain;
                                 if (rms > maxBands[band]) maxBands[band] = rms;
