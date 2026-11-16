@@ -2623,7 +2623,7 @@ void D2DRenderer::DrawEqualizerWaves(D2D1_POINT_2F origin, float height, const f
     for (int i = 0; i < kBarCount; ++i) {
         float v = Utils::Clamp(inputBands[i], 0.0f, 1.0f);
         // Keep a small idle baseline, with headroom for loud transients.
-        const float barH = height * (0.10f + 0.74f * v);
+        const float barH = height * (0.14f + 0.82f * v);
         const float barLeft = origin.x + i * kBarPitch;
         const D2D1_ROUNDED_RECT r = D2D1::RoundedRect(
             D2D1::RectF(barLeft, centerY - barH / 2.0f, barLeft + kBarWidth, centerY + barH / 2.0f),
@@ -3642,7 +3642,7 @@ void IslandWindow::UpdateEqualizerSmoothing() {
     // Independent envelopes per frequency band: quick attack, gentle release.
     for (int i = 0; i < 6; ++i) {
         const float goal = Utils::Clamp(target.values[i], 0.0f, 1.0f);
-        const float rate = (goal > m_eqBandSmooth[i]) ? 8.0f : 2.8f;
+        const float rate = (goal > m_eqBandSmooth[i]) ? 12.0f : 3.6f;
         const float alpha = 1.0f - std::exp(-rate * dtF);
         m_eqBandSmooth[i] += (goal - m_eqBandSmooth[i]) * alpha;
     }
@@ -3665,8 +3665,8 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             // Per-frame smoothed bands (updated in UpdateEqualizerSmoothing)
             // keep the compact bars moving fluidly instead of stepping.
             m_renderer->DrawEqualizerWaves(
-                D2D1::Point2F(w - 28.0f, (h - 12.0f) / 2.0f),
-                12.0f,
+                D2D1::Point2F(w - 28.0f, (h - 18.0f) / 2.0f),
+                18.0f,
                 m_eqBandSmooth,
                 eqActive
             );
@@ -6612,11 +6612,14 @@ void AudioService::UpdateLoopback() {
                         }
 
                         if (n > 0) {
-                            // Higher gain makes quieter audio move the six bands more visibly.
-                            constexpr float kEqualizerGain = 7.0f;
+                            // Perceptual expansion: band-pass RMS values are naturally small,
+                            // so linear scaling made the compact equalizer barely move.
+                            // The square-root curve lifts quiet details while preserving peaks.
+                            constexpr float kEqualizerGain = 14.0f;
                             for (int band = 0; band < 6; ++band) {
-                                const float rms = std::sqrt(sumSquares[band] / static_cast<float>(n)) * kEqualizerGain;
-                                if (rms > maxBands[band]) maxBands[band] = rms;
+                                const float rms = std::sqrt(sumSquares[band] / static_cast<float>(n));
+                                const float level = std::sqrt(Utils::Clamp(rms * kEqualizerGain, 0.0f, 1.0f));
+                                if (level > maxBands[band]) maxBands[band] = level;
                             }
                         }
                     }
