@@ -1130,6 +1130,7 @@ private:
     bool m_wasACConnected = false;
     bool m_hasKnownACStatus = false;
     bool m_lowBatteryAlerted = false;
+    bool m_wasBatterySaver = false;
     bool m_isRunning = false;
     ULONGLONG m_lastPollTick = 0;
 };
@@ -3785,17 +3786,19 @@ void IslandWindow::RenderCompactContent(EventType eventType, float w, float h, f
             break;
         }
         case EventType::Power: {
-            const bool charging = trState.title != L"On battery";
+            const bool charging = trState.title == L"Charging";
+            const bool batterySaver = trState.title == L"Battery saver";
             D2D1_RECT_F batRect = D2D1::RectF(12.0f, (h - 22.0f) / 2.0f, 34.0f, (h + 22.0f) / 2.0f);
             const D2D1_COLOR_F batteryColor = charging
                 ? D2D1::ColorF(0.188f, 0.820f, 0.345f, alpha)
-                : D2D1::ColorF(0.92f, 0.68f, 0.20f, alpha);
+                : (batterySaver
+                    ? D2D1::ColorF(1.0f, 0.58f, 0.12f, alpha)
+                    : D2D1::ColorF(1.0f, 1.0f, 1.0f, alpha));
             m_renderer->DrawIconImage(Graphics::IconType::BatteryHorizontal, batRect, batteryColor);
 
-            std::wstring powerLabel = charging ? L"Charging" : L"On battery";
-            if (trState.value >= 0 && trState.value <= 100) {
-                powerLabel += L"  " + std::to_wstring(trState.value) + L"%";
-            }
+            const std::wstring powerLabel = charging
+                ? L"Charging"
+                : (batterySaver ? L"Battery saver" : L"On battery");
             m_renderer->DrawTextString(
                 powerLabel,
                 D2D1::RectF(40.0f, (h - 16.0f) / 2.0f, w - 10.0f, (h + 16.0f) / 2.0f),
@@ -6775,9 +6778,11 @@ void PowerService::Start() {
     m_lastPollTick = 0;
     m_hasKnownACStatus = false;
     m_lowBatteryAlerted = false;
+    m_wasBatterySaver = false;
     
     SYSTEM_POWER_STATUS sps{};
     if (GetSystemPowerStatus(&sps)) {
+        m_wasBatterySaver = (sps.SystemStatusFlag == 1 && sps.ACLineStatus != 1);
         if (sps.BatteryLifePercent <= 100) {
             m_batteryPercent = sps.BatteryLifePercent;
         }
@@ -6813,18 +6818,21 @@ void PowerService::Poll() {
     const bool currentAC = (sps.ACLineStatus == 1);
     const bool hasBatteryPercent = (sps.BatteryLifePercent <= 100);
     const BYTE currentPercent = sps.BatteryLifePercent;
+    const bool currentBatterySaver = (sps.SystemStatusFlag == 1 && !currentAC);
+    const bool powerModeChanged = hasACStatus && m_hasKnownACStatus && currentAC != m_wasACConnected;
+    const bool saverModeChanged = currentBatterySaver != m_wasBatterySaver;
 
+    if ((powerModeChanged || saverModeChanged) && GetSettingsSnapshot().enablePowerHUD) {
+        QueuedEvent qe;
+        qe.type = EventType::Power;
+        qe.durationMs = DURATION_POWER_MS;
+        qe.title = currentAC ? L"Charging" : (currentBatterySaver ? L"Battery saver" : L"On battery");
+        qe.progressPercent = -1; // Battery percentage is intentionally not displayed.
+        m_manager->PostTransientEvent(qe);
+    }
+
+    m_wasBatterySaver = currentBatterySaver;
     if (hasACStatus) {
-        if (m_hasKnownACStatus && currentAC != m_wasACConnected) {
-            if (GetSettingsSnapshot().enablePowerHUD) {
-                QueuedEvent qe;
-                qe.type = EventType::Power;
-                qe.durationMs = DURATION_POWER_MS;
-                qe.title = currentAC ? L"Charging" : L"On battery";
-                qe.progressPercent = hasBatteryPercent ? static_cast<int>(currentPercent) : -1;
-                m_manager->PostTransientEvent(qe);
-            }
-        }
         m_wasACConnected = currentAC;
         m_isACConnected = currentAC;
         m_hasKnownACStatus = true;
